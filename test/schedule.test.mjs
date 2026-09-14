@@ -7,6 +7,7 @@ import {
   nextTransition,
   status,
   formatDuration,
+  dayCells,
 } from "../lib/schedule.mjs";
 
 const W = loadSchedule({}); // defaults, no ENV
@@ -118,5 +119,32 @@ describe("loadSchedule", () => {
     // the window tail belongs to the next day
     assert.equal(isPeak(D("2026-09-15T01:00:00Z"), w), true);
     assert.equal(isPeak(D("2026-09-15T02:00:00Z"), w), false);
+  });
+});
+
+describe("dayCells", () => {
+  it("Monday: 48 half-hour slots, peak at 01-04 and 06-10", () => {
+    const cells = dayCells(D("2026-09-14T12:00:00Z"), W);
+    assert.equal(cells.length, 48);
+    assert.equal(cells[0].start.toISOString(), "2026-09-14T00:00:00.000Z");
+    const peakIdx = cells.map((c, i) => (c.peak ? i : -1)).filter((i) => i >= 0);
+    assert.deepEqual(peakIdx, [2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
+  it("Saturday: all off-peak", () => {
+    assert.ok(dayCells(D("2026-09-19T12:00:00Z"), W).every((c) => !c.peak));
+  });
+
+  it("hourly slots", () => {
+    const cells = dayCells(D("2026-09-14T12:00:00Z"), W, 1);
+    assert.equal(cells.length, 24);
+    assert.deepEqual(
+      cells.map((c) => c.peak),
+      [0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].map(Boolean),
+    );
+  });
+
+  it("rejects bad granularity", () => {
+    assert.throws(() => dayCells(D("2026-09-14T00:00:00Z"), W, 0), /slotsPerHour/);
   });
 });

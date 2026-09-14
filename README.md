@@ -32,6 +32,8 @@ Commands:
 | Command | What it does |
 |---|---|
 | `status` (default) | One-shot status with countdowns. `--json` for machines. |
+| `day [--date YYYY-MM-DD]` | 24h peak/off-peak timeline with a now-marker (default: today, UTC). |
+| `report [options]` | Totals from the plugin event ledger; `--estimate` adds rough $ savings. |
 | `watch` | Live countdown, refreshed every second (Ctrl+C to exit). |
 | `is-peak [--json]` | Exit `1` during peak, `0` off-peak. For shell scripts / CI. |
 | `next [--unix] [--json]` | Print the next schedule transition. |
@@ -39,7 +41,9 @@ Commands:
 
 `wait` options: `--for peak|offpeak` (default `offpeak`), `--timeout SEC`
 (exit 2 on timeout), `--poll SEC` (default 5), `--exec "CMD"` (run a shell
-command once the condition is met), `--quiet` (exit code only).
+command once the condition is met), `--notify URL` (POST a JSON alert once
+the condition is met, e.g. `https://ntfy.sh/your-topic`), `--quiet`
+(exit code only).
 
 Examples:
 
@@ -50,8 +54,14 @@ deepseek-peak is-peak || ./run-batch-job.sh
 # Start an opencode run as soon as off-peak begins (max 2h of waiting):
 deepseek-peak wait --timeout 7200 --exec "opencode run 'nightly refactor'"
 
+# Get pinged on your phone when off-peak starts:
+deepseek-peak wait --timeout 7200 --notify https://ntfy.sh/my-deepseek
+
 # Next transition as epoch seconds (for cron/systemd):
 deepseek-peak next --unix
+
+# What did the guard save me?
+deepseek-peak report --estimate
 ```
 
 Make it global with `npm link` (exposes the `deepseek-peak` binary), or add
@@ -67,6 +77,44 @@ export DEEPSEEK_PEAK_SCHEDULE='[{"days":[1,2,3,4,5],"start":"01:00","end":"04:00
 
 Format: JSON array of `{"days":[0..6, Sun..Sat],"start":"HH:MM","end":"HH:MM"}`
 (UTC; `end <= start` means an overnight window).
+
+### Day timeline
+
+```sh
+deepseek-peak day [--date 2026-09-19] [--json]
+```
+
+Renders a 24h bar (`█` peak, `░` off-peak) with an hour ruler and a
+now-marker when viewing today. Handy for planning batch work.
+
+### Savings ledger & report
+
+The plugin appends every blocked request, warn-mode pass, aborted session,
+and schedule transition to a JSONL ledger (default
+`~/.local/share/deepseek-peak/events.jsonl`, honours `XDG_DATA_HOME`;
+override with `DEEPSEEK_PEAK_LEDGER=<path|0>`):
+
+```sh
+deepseek-peak report [--ledger PATH] [--since YYYY-MM-DD] [--json]
+deepseek-peak report --estimate [--avg-in 4000 --avg-out 1000 \
+  --input-price 0.3 --output-price 1.2]
+```
+
+`--estimate` multiplies blocked requests by the peak-vs-off-peak price
+delta — explicitly rough (it assumes average token counts), but good
+enough to see whether the guard earns its keep.
+
+### Transition notifications
+
+POST a JSON alert (`{service, event, message, at}`) to any HTTP endpoint —
+works with ntfy.sh, healthcheck-style webhooks, or your own collector:
+
+```sh
+deepseek-peak wait --notify https://ntfy.sh/my-deepseek
+```
+
+The plugin can do the same on every schedule transition via the
+`notifyUrl` option (see below).
 
 ## opencode plugin
 
@@ -100,6 +148,11 @@ What it does:
   `chat.params` + `session.status` events, double-checked with
   `client.session.status()`), shows a TUI toast, and writes to the opencode
   log. When off-peak begins it shows a "0.5x rates" toast.
+- **Pre-transition warning** — a heads-up toast `warnBeforeMin` minutes
+  before each transition (default 10), so you can wrap up in time.
+- **Ledger** — every block, warn-mode pass, abort, and transition is
+  appended to a JSONL ledger for `deepseek-peak report`.
+- **Notifications** — optional JSON POST to `notifyUrl` on transitions.
 - Non-DeepSeek models are never blocked; with `abortAllOnPeak: true` their
   busy sessions are aborted too (default `false`).
 
@@ -113,6 +166,9 @@ Options (second tuple element) and ENV overrides:
 | `toast` | `true` | `DEEPSEEK_PEAK_TOAST=0` |
 | `log` | `true` | `DEEPSEEK_PEAK_LOG=0` |
 | `match: string[]` | `[]` | — (extra substrings treated as DeepSeek) |
+| `warnBeforeMin` | `10` | `DEEPSEEK_PEAK_WARN_BEFORE` (0 disables) |
+| `ledger: bool \| path` | `true` | `DEEPSEEK_PEAK_LEDGER` (path, or 0 to disable) |
+| `notifyUrl` | `""` | `DEEPSEEK_PEAK_NOTIFY_URL` |
 | `disabled` | `false` | `DEEPSEEK_PEAK_DISABLE=1` (kill-switch) |
 
 ## Development
@@ -133,9 +189,13 @@ and abort-selection at the peak transition.
 ```
 deepseek-peak/
   lib/schedule.mjs      schedule core (UTC, no deps)
-  cli.mjs               CLI (status/watch/wait/next/is-peak)
+  lib/ledger.mjs        JSONL ledger: append/read/summarize/savings estimate
+  lib/notify.mjs        best-effort JSON POST alerts (ntfy/webhooks)
+  cli.mjs               CLI (status/day/report/watch/wait/next/is-peak)
   opencode-plugin.ts    opencode plugin (type-only external import)
   test/schedule.test.mjs
+  test/ledger.test.mjs
+  test/notify.test.mjs
   test/plugin.smoke.mjs
   package.json / tsconfig.json / README.md
 ```

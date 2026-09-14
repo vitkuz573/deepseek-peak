@@ -20,7 +20,10 @@ import {
   formatTimeLocal,
   formatClockUTC,
   describeWindows,
+  dayCells,
 } from "./lib/schedule.mjs";
+import { defaultLedgerPath, readEvents, summarize, estimateSavings } from "./lib/ledger.mjs";
+import { notify } from "./lib/notify.mjs";
 
 const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
 const red = (s) => (useColor ? `\x1b[31m${s}\x1b[0m` : s);
@@ -115,6 +118,19 @@ async function cmdWait(opts) {
     const met = target === "peak" ? peak : !peak;
     if (met) {
       if (!opts.quiet) console.log(target === "peak" ? "Peak hours are on." : "Off-peak hours are on. DeepSeek calls are half price.");
+      if (opts.notify) {
+        const event = target === "peak" ? "peak-start" : "offpeak-start";
+        const ok = await notify(opts.notify, {
+          service: "deepseek-peak",
+          event,
+          message:
+            target === "peak"
+              ? "DeepSeek peak hours started — standard (2x) rates."
+              : "DeepSeek off-peak hours started — discounted (0.5x) rates.",
+          at: new Date().toISOString(),
+        });
+        if (!opts.quiet) console.log(ok ? `Notified ${opts.notify}.` : `Notify to ${opts.notify} failed (continuing anyway).`);
+      }
       if (opts.exec) {
         const r = spawnSync(opts.exec, { shell: true, stdio: "inherit" });
         return r.status ?? 0;
@@ -168,6 +184,89 @@ async function cmdWatch() {
   }
 }
 
+function parseDay(value) {
+  if (value == null || value === "") {
+    const n = new Date();
+    return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate()));
+  }
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) throw new Error(`Bad --date: ${value}, expected YYYY-MM-DD`);
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  if (Number.isNaN(d.getTime())) throw new Error(`Bad --date: ${value}`);
+  return d;
+}
+
+function cmdDay(opts) {
+  const day = parseDay(opts.date);
+  const windows = loadSchedule();
+  const cells = dayCells(day, windows, 2); // 48 half-hour slots
+  if (opts.json) {
+    console.log(JSON.stringify(cells.map((c) => ({ start: c.start.toISOString(), peak: c.peak }))));
+    return 0;
+  }
+  const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][day.getUTCDay()];
+  const ymd = day.toISOString().slice(0, 10);
+  let ruler = "";
+  let ticks = "";
+  for (let h = 0; h < 24; h += 3) {
+    ruler += String(h).padStart(2, "0") + "    ";
+    ticks += "|" + "     ";
+  }
+  console.log(bold(`DeepSeek · ${dayName} ${ymd} (UTC)`));
+  console.log(dim(ruler));
+  console.log(dim(ticks));
+  console.log(cells.map((c) => (c.peak ? red("█") : green("░"))).join(""));
+  const now = new Date();
+  const dayStartMs = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+  if (now.getTime() >= dayStartMs && now.getTime() < dayStartMs + 86400000) {
+    const idx = Math.min(47, Math.floor((now.getTime() - dayStartMs) / 1800000));
+    const pad2 = (n) => String(n).padStart(2, "0");
+    console.log(
+      " ".repeat(idx) + "^" + ` now ${pad2(now.getUTCHours())}:${pad2(now.getUTCMinutes())} UTC — ${isPeak(now, windows) ? "PEAK" : "OFF-PEAK"}`,
+    );
+  }
+  console.log(dim(`Peak ${describeWindows(windows)} · off-peak half price`));
+  return 0;
+}
+
+async function cmdReport(opts) {
+  const path = opts.ledger ?? defaultLedgerPath();
+  const events = await readEvents(path, { since: opts.since ?? undefined });
+  const s = summarize(events);
+  const est = opts.estimate
+    ? estimateSavings(s.blocked, {
+        avgIn: opts.avgIn,
+        avgOut: opts.avgOut,
+        inputPrice: opts.inputPrice,
+        outputPrice: opts.outputPrice,
+      })
+    : null;
+  if (opts.json) {
+    console.log(JSON.stringify({ ledger: path, ...s, estimate: est }, null, 2));
+    return 0;
+  }
+  console.log(`DeepSeek peak-guard report · ledger ${path}`);
+  if (events.length === 0) {
+    console.log("No events recorded yet. The opencode plugin writes here on every block/abort/transition.");
+    return 0;
+  }
+  console.log(`Events: ${s.total} (${(s.firstTs ?? "?").slice(0, 10)} → ${(s.lastTs ?? "?").slice(0, 10)})`);
+  console.log(`Blocked requests: ${bold(String(s.blocked))} · warn-mode passes: ${s.warned} · aborted sessions: ${s.aborted}`);
+  console.log(`Transitions seen: ${s.peakStarts} peak starts, ${s.offpeakStarts} off-peak starts`);
+  for (const day of Object.keys(s.byDay).sort()) {
+    const d = s.byDay[day];
+    console.log(`  ${day}: blocked ${d.blocked} · warned ${d.warned} · aborted ${d.aborted}`);
+  }
+  if (est) {
+    console.log(
+      `Rough savings: $${est.totalUsd.toFixed(2)} across ${s.blocked} blocked request(s) ` +
+        `(~$${est.perRequestUsd.toFixed(4)} each; assumes ${est.assumptions.avgIn} in / ${est.assumptions.avgOut} out ` +
+        `tokens at $${est.assumptions.inputPrice}/$${est.assumptions.outputPrice} per 1M peak input/output tokens).`,
+    );
+  }
+  return 0;
+}
+
 function printHelp() {
   console.log(`deepseek-peak — track DeepSeek API peak/off-peak pricing hours.
 
@@ -175,6 +274,8 @@ Usage: deepseek-peak [command] [options]
 
 Commands:
   status                 one-shot status with countdowns (default)
+  day [--date YYYY-MM-DD] 24h peak/off-peak timeline (default: today, UTC)
+  report [options]       totals from the plugin event ledger (+ --estimate $)
   is-peak [--json]       exit 1 during peak, 0 off-peak (for scripts/CI)
   next [--unix] [--json] print the next schedule transition
   wait [options]         block until peak/off-peak hours start
@@ -185,7 +286,18 @@ Wait options:
   --timeout SEC          give up after SEC seconds (exit 2)
   --poll SEC             re-check every SEC seconds (default: 5)
   --exec "CMD"           run CMD via shell once the condition is met
+  --notify URL           POST a JSON alert to URL once the condition is met
+                         (e.g. https://ntfy.sh/your-topic)
   --quiet, -q            print nothing, only set the exit code
+
+Report options:
+  --ledger PATH          ledger file (default: XDG data dir events.jsonl)
+  --since YYYY-MM-DD     only events from this date on
+  --estimate             add a rough $ savings estimate for blocked requests
+  --avg-in N             assumed input tokens per request (default: 4000)
+  --avg-out N            assumed output tokens per request (default: 1000)
+  --input-price X        peak input $ per 1M tokens (default: 0.3)
+  --output-price Y       peak output $ per 1M tokens (default: 1.2)
 
 General options:
   --json                 machine-readable output (status, is-peak, next)
@@ -197,13 +309,32 @@ Environment:
 
 Examples:
   deepseek-peak status
+  deepseek-peak day
+  deepseek-peak report --estimate
   deepseek-peak is-peak || echo "cheap now, run the batch job"
   deepseek-peak wait --timeout 7200 --exec "opencode run 'nightly refactor'"`);
 }
 
 function parseArgs(argv) {
   const args = [...argv];
-  const opts = { json: false, unix: false, quiet: false, for: "offpeak", timeout: 0, poll: 5, exec: null };
+  const opts = {
+    json: false,
+    unix: false,
+    quiet: false,
+    for: "offpeak",
+    timeout: 0,
+    poll: 5,
+    exec: null,
+    notify: null,
+    date: null,
+    since: null,
+    ledger: null,
+    estimate: false,
+    avgIn: 4000,
+    avgOut: 1000,
+    inputPrice: 0.3,
+    outputPrice: 1.2,
+  };
   let command = "status";
   const positionals = [];
   while (args.length > 0) {
@@ -219,12 +350,29 @@ function parseArgs(argv) {
     else if (a.startsWith("--poll=")) opts.poll = Number(a.slice("--poll=".length));
     else if (a === "--exec") opts.exec = args.shift() ?? null;
     else if (a.startsWith("--exec=")) opts.exec = a.slice("--exec=".length);
+    else if (a === "--notify") opts.notify = args.shift() ?? null;
+    else if (a.startsWith("--notify=")) opts.notify = a.slice("--notify=".length);
+    else if (a === "--date") opts.date = args.shift() ?? null;
+    else if (a.startsWith("--date=")) opts.date = a.slice("--date=".length);
+    else if (a === "--since") opts.since = args.shift() ?? null;
+    else if (a.startsWith("--since=")) opts.since = a.slice("--since=".length);
+    else if (a === "--ledger") opts.ledger = args.shift() ?? null;
+    else if (a.startsWith("--ledger=")) opts.ledger = a.slice("--ledger=".length);
+    else if (a === "--estimate") opts.estimate = true;
+    else if (a === "--avg-in") opts.avgIn = Number(args.shift() ?? 4000);
+    else if (a.startsWith("--avg-in=")) opts.avgIn = Number(a.slice("--avg-in=".length));
+    else if (a === "--avg-out") opts.avgOut = Number(args.shift() ?? 1000);
+    else if (a.startsWith("--avg-out=")) opts.avgOut = Number(a.slice("--avg-out=".length));
+    else if (a === "--input-price") opts.inputPrice = Number(args.shift() ?? 0.3);
+    else if (a.startsWith("--input-price=")) opts.inputPrice = Number(a.slice("--input-price=".length));
+    else if (a === "--output-price") opts.outputPrice = Number(args.shift() ?? 1.2);
+    else if (a.startsWith("--output-price=")) opts.outputPrice = Number(a.slice("--output-price=".length));
     else if (a === "-h" || a === "--help") return { command: "help", opts };
     else if (a.startsWith("-")) throw new Error(`Unknown flag: ${a}`);
     else positionals.push(a);
   }
   if (positionals.length > 0) command = positionals[0];
-  if (!["status", "is-peak", "next", "wait", "watch", "help"].includes(command)) {
+  if (!["status", "is-peak", "next", "wait", "watch", "day", "report", "help"].includes(command)) {
     throw new Error(`Unknown command: ${command}`);
   }
   if (!["peak", "offpeak"].includes(opts.for)) throw new Error(`--for must be "peak" or "offpeak"`);
@@ -257,6 +405,12 @@ async function main() {
         return;
       case "wait":
         process.exitCode = await cmdWait(parsed.opts);
+        return;
+      case "day":
+        process.exitCode = cmdDay(parsed.opts);
+        return;
+      case "report":
+        process.exitCode = await cmdReport(parsed.opts);
         return;
       case "watch":
         process.exitCode = await cmdWatch();

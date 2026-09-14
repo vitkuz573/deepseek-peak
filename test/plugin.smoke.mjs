@@ -9,6 +9,11 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { unlink } from "node:fs/promises";
+import { readEvents } from "../lib/ledger.mjs";
 
 const pad = (n) => String(n).padStart(2, "0");
 
@@ -24,7 +29,15 @@ function synthesizePeakAroundNow() {
 const scheduled = [];
 const realSetTimeout = globalThis.setTimeout;
 
-function makeClient(calls) {
+async function waitFor(cond, timeoutMs = 5000) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((r) => realSetTimeout(r, 25));
+  }
+}
+
+function makeClient(calls, busySessions = { "sess-deep": { type: "busy" } }) {
   return {
     app: {
       log: async ({ body }) => {
@@ -39,7 +52,7 @@ function makeClient(calls) {
       },
     },
     session: {
-      status: async () => ({ "sess-deep": { type: "busy" } }),
+      status: async () => busySessions,
       abort: async ({ path }) => {
         calls.aborts.push(path.id);
         return true;
@@ -58,10 +71,15 @@ function chatInput(sessionID, modelID, providerID) {
   };
 }
 
+const tmpLedger = join(tmpdir(), `deepseek-peak-plugin-test-${process.pid}.jsonl`);
+
 describe("opencode plugin (synthetic peak window)", () => {
   let plugin;
   let hooks;
   let calls;
+  let notifyServer;
+  let notifyUrl;
+  let notified = [];
 
   before(async () => {
     synthesizePeakAroundNow();
@@ -71,14 +89,31 @@ describe("opencode plugin (synthetic peak window)", () => {
       if (typeof handle.unref === "function") handle.unref();
       return handle;
     };
+    notified = [];
+    notifyServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        notified.push(body);
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("ok");
+      });
+    });
+    await new Promise((resolve) => notifyServer.listen(0, "127.0.0.1", resolve));
+    notifyUrl = `http://127.0.0.1:${notifyServer.address().port}/hook`;
     calls = { logs: [], toasts: [], aborts: [] };
     plugin = (await import("../opencode-plugin.ts")).default;
-    hooks = await plugin({ client: makeClient(calls) }, { mode: "block" });
+    // ledger:false — the default ledger path is the real user data dir,
+    // which tests must never touch.
+    hooks = await plugin({ client: makeClient(calls) }, { mode: "block", ledger: false });
   });
 
-  after(() => {
+  after(async () => {
     globalThis.setTimeout = realSetTimeout;
     delete process.env.DEEPSEEK_PEAK_SCHEDULE;
+    delete process.env.DEEPSEEK_PEAK_LEDGER;
+    await new Promise((resolve) => notifyServer.close(resolve));
+    await unlink(tmpLedger).catch(() => {});
   });
 
   it("logs an activation message on init", () => {
@@ -105,10 +140,60 @@ describe("opencode plugin (synthetic peak window)", () => {
 
   it("warn mode lets requests through with a toast", async () => {
     const warnCalls = { logs: [], toasts: [], aborts: [] };
-    const warnHooks = await plugin({ client: makeClient(warnCalls) }, { mode: "warn" });
+    const warnHooks = await plugin({ client: makeClient(warnCalls) }, { mode: "warn", ledger: false });
     await warnHooks["chat.params"](chatInput("sess-warn", "deepseek-chat", "deepseek"));
     assert.equal(warnCalls.toasts.length, 1);
     assert.match(warnCalls.toasts[0].message, /peak hours/);
+  });
+
+  it("warns shortly before the transition", async () => {
+    // scheduled: [transition, warn] per plugin instance; [0] and [1] are ours.
+    const warnTimer = scheduled[1];
+    assert.ok(warnTimer && warnTimer.ms > 1000, "expected an armed warn timer");
+    const before = calls.toasts.length;
+    await warnTimer.fn();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.toasts.length, before + 1);
+    assert.match(calls.toasts.at(-1).message, /starts in/);
+  });
+
+  it("writes blocked requests to the ledger", async () => {
+    const ledgerCalls = { logs: [], toasts: [], aborts: [] };
+    const ledgerHooks = await plugin({ client: makeClient(ledgerCalls) }, { ledger: tmpLedger });
+    await assert.rejects(
+      () => ledgerHooks["chat.params"](chatInput("sess-ledger", "deepseek-chat", "deepseek")),
+      /peak hours/,
+    );
+    // chat.params awaits ledger writes, so the event is on disk already.
+    const events = await readEvents(tmpLedger);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "blocked");
+    assert.equal(events[0].session, "sess-ledger");
+    assert.match(events[0].model, /deepseek/);
+  });
+
+  it("POSTs a JSON alert on peak start", async () => {
+    const nCalls = { logs: [], toasts: [], aborts: [] };
+    const base = scheduled.length;
+    const nHooks = await plugin(
+      { client: makeClient(nCalls, { "sess-notify": { type: "busy" } }) },
+      { ledger: false, notifyUrl },
+    );
+    await assert.rejects(
+      () => nHooks["chat.params"](chatInput("sess-notify", "deepseek-chat", "deepseek")),
+      /peak hours/,
+    );
+    await nHooks.event({
+      event: { type: "session.status", properties: { sessionID: "sess-notify", status: { type: "busy" } } },
+    });
+    await scheduled[base].fn(); // this instance's transition timer
+    // notify() is fire-and-forget by design — poll for the HTTP round-trip.
+    await waitFor(() => notified.length > 0);
+    assert.deepEqual(nCalls.aborts, ["sess-notify"]);
+    const body = JSON.parse(notified.at(-1));
+    assert.equal(body.service, "deepseek-peak");
+    assert.equal(body.event, "peak-start");
+    assert.match(body.message, /peak hours started/);
   });
 
   it("aborts busy DeepSeek sessions when peak begins, keeps others", async () => {
