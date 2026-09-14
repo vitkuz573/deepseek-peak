@@ -38,7 +38,9 @@ export async function withEnv(vars, fn) {
   }
 }
 
-/** Capture console.log/error; call restore() when done (afterEach). */
+/** Capture console.log/error while still forwarding everything to the real
+ *  sinks (passthrough). The test runner's own TAP reporter breaks when
+ *  console output is swallowed, so never swallow — only record. */
 export function stubConsole() {
   const logs = [];
   const errors = [];
@@ -46,9 +48,11 @@ export function stubConsole() {
   const origError = console.error;
   console.log = (...a) => {
     logs.push(a.join(" "));
+    origLog(...a);
   };
   console.error = (...a) => {
     errors.push(a.join(" "));
+    origError(...a);
   };
   return {
     logs,

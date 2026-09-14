@@ -38,6 +38,7 @@ Commands:
 | `is-peak [--json]` | Exit `1` during peak, `0` off-peak. For shell scripts / CI. |
 | `next [--unix] [--json]` | Print the next schedule transition. |
 | `wait [options]` | Block until peak/off-peak hours start. |
+| `sync [options]` | Re-fetch peak hours from the pricing docs and cache them. `--check` exits 1 when the docs differ from built-in defaults (cron/CI). |
 
 `wait` options: `--for peak|offpeak` (default `offpeak`), `--timeout SEC`
 (exit 2 on timeout), `--poll SEC` (default 5), `--exec "CMD"` (run a shell
@@ -77,6 +78,34 @@ export DEEPSEEK_PEAK_SCHEDULE='[{"days":[1,2,3,4,5],"start":"01:00","end":"04:00
 
 Format: JSON array of `{"days":[0..6, Sun..Sat],"start":"HH:MM","end":"HH:MM"}`
 (UTC; `end <= start` means an overnight window).
+
+### Schedule sync
+
+There is no official machine-readable feed for the peak windows, so
+`deepseek-peak sync` scrapes the pricing docs page and extracts them with
+strict, fail-loud parsing — anything ambiguous (unknown timezone, unknown
+day scope, implausible times, removed peak hours) aborts with a clear error
+instead of guessing:
+
+```sh
+deepseek-peak sync [--url URL] [--cache PATH] [--json]
+deepseek-peak sync --check || echo "peak hours changed upstream!"
+```
+
+`sync` validates before writing the cache (`~/.cache/deepseek-peak/schedule.json`,
+honours `XDG_CACHE_HOME`, override with `DEEPSEEK_PEAK_CACHE`, page override
+with `DEEPSEEK_PEAK_URL`). The guard and the CLI pick up a valid cache
+automatically — precedence is `DEEPSEEK_PEAK_SCHEDULE` env > cache file >
+built-in defaults — and `status` always tells you which source is active
+(warning when the cache is missing/invalid/stale, i.e. older than 30 days).
+`--check` exits `1` when the docs differ from the built-in defaults
+(`0` when unchanged, `2` on fetch/parse failure), which makes it a good
+weekly cron job:
+
+```sh
+# crontab: alert me when DeepSeek changes peak hours
+0 9 * * 1 deepseek-peak sync --check || ntfy publish my-alerts "DeepSeek peak hours changed"
+```
 
 ### Day timeline
 
@@ -200,14 +229,16 @@ synthetic schedules (deterministic at any hour).
 
 ```
 deepseek-peak/
-  lib/schedule.mjs      schedule core (UTC, no deps)
+  lib/schedule.mjs      schedule core (UTC, no deps) + sync-cache loading
+  lib/sync.mjs          docs scraping with strict parsing + cache writing
   lib/match.mjs         endpoint-first DeepSeek matching (official API vs proxies)
   lib/ledger.mjs        JSONL ledger: append/read/summarize/savings estimate
   lib/notify.mjs        best-effort JSON POST alerts (ntfy/webhooks)
   lib/commands.mjs      all CLI logic (import-safe; cli.mjs is a 3-line entry)
-  cli.mjs               CLI entry point (status/day/report/watch/wait/next/is-peak)
+  cli.mjs               CLI entry point (status/day/report/watch/wait/next/is-peak/sync)
   opencode-plugin.ts    opencode plugin (type-only external import)
   test/schedule.test.mjs
+  test/sync.test.mjs
   test/match.test.mjs
   test/ledger.test.mjs
   test/notify.test.mjs

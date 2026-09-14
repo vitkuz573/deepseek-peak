@@ -9,7 +9,8 @@
 //
 // Peak schedule (UTC): Mon–Fri 01:00–04:00 and 06:00–10:00, everything else
 // is off-peak. Source: https://api-docs.deepseek.com/quick_start/pricing
-// The schedule can be overridden with DEEPSEEK_PEAK_SCHEDULE (see lib/schedule.mjs).
+// Schedule resolution order: DEEPSEEK_PEAK_SCHEDULE env >
+// `deepseek-peak sync` cache file > built-in defaults (see lib/schedule.mjs).
 //
 // Installation (global).
 // Option A — drop-in, no config edit needed: copy opencode-plugin.ts plus the
@@ -54,7 +55,7 @@
 
 import type { Plugin } from "@opencode-ai/plugin";
 import {
-  loadSchedule,
+  loadScheduleWithMeta,
   status,
   isPeak,
   nextTransition,
@@ -62,7 +63,9 @@ import {
   formatTimeUTC,
   formatClockUTC,
   describeWindows,
+  cacheAgeDays,
 } from "./lib/schedule.mjs";
+import { STALE_AFTER_DAYS } from "./lib/sync.mjs";
 import { resolveLedgerPath, appendEvent } from "./lib/ledger.mjs";
 import { notify } from "./lib/notify.mjs";
 import { shouldGuardDeepSeek, hostOf } from "./lib/match.mjs";
@@ -145,7 +148,8 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
   const opts = resolveOptions(rawOptions);
   if (opts.disabled) return {};
 
-  const windows = loadSchedule();
+  const loaded = loadScheduleWithMeta();
+  const windows = loaded.windows;
   // Last endpoint info seen per session (from chat.params) + sessions currently
   // busy (from session.status events). Used to abort official-API sessions when
   // peak begins.
@@ -295,10 +299,23 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
   await log(
     "info",
     `deepseek-peak active (mode=${opts.mode}, match=${opts.matchMode}, abortOnPeak=${opts.abortOnPeak}, ` +
-      `warnBeforeMin=${opts.warnBeforeMin}, ledger=${ledgerPath ?? "off"}, notify=${opts.notifyUrl ? "on" : "off"}). ` +
+      `warnBeforeMin=${opts.warnBeforeMin}, ledger=${ledgerPath ?? "off"}, notify=${opts.notifyUrl ? "on" : "off"}, ` +
+      `source=${loaded.source}). ` +
       `Now: ${s0.peak ? "PEAK" : "OFF-PEAK"}; next change: ${s0.transition.to} at ` +
       `${formatTimeUTC(s0.transition.at)} (in ${formatDuration(s0.transition.inMs)}).`,
   );
+  if (loaded.source === "cache" && cacheAgeDays(loaded.meta) > STALE_AFTER_DAYS) {
+    await log(
+      "warn",
+      `Schedule cache is older than ${STALE_AFTER_DAYS} days (fetched ${loaded.meta.fetchedAt ?? "unknown"}) — ` +
+        `run \`deepseek-peak sync\` to refresh.`,
+    );
+  } else if (loaded.source === "builtin" && loaded.cacheIssue) {
+    await log(
+      "warn",
+      `Schedule cache ignored (${loaded.cacheIssue}) — using built-in defaults. Run \`deepseek-peak sync\` to refresh.`,
+    );
+  }
   armTimer();
 
   return {

@@ -1,8 +1,17 @@
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFile, unlink } from "node:fs/promises";
 import {
   DEFAULT_WINDOWS,
   loadSchedule,
+  loadScheduleWithMeta,
+  normalizeWindows,
+  defaultCachePath,
+  resolveCachePath,
+  readCacheFile,
+  cacheAgeDays,
   isPeak,
   windowAt,
   nextTransition,
@@ -236,5 +245,79 @@ describe("local time formatting", () => {
     const east = new Date("2026-09-14T09:06:38Z");
     east.getTimezoneOffset = () => -330; // UTC+05:30
     assert.match(formatTimeLocal(east), /\(UTC\+05:30\)/);
+  });
+});
+
+describe("schedule cache", () => {
+  const cacheFile = join(tmpdir(), `deepseek-peak-cache-test-${process.pid}.json`);
+  after(async () => {
+    await unlink(cacheFile).catch(() => {});
+  });
+
+  it("default and resolve paths", () => {
+    assert.ok(defaultCachePath({}).endsWith(join("deepseek-peak", "schedule.json")));
+    assert.equal(defaultCachePath({ XDG_CACHE_HOME: "/tmp/xdg" }), "/tmp/xdg/deepseek-peak/schedule.json");
+    assert.ok(defaultCachePath({ XDG_CACHE_HOME: "" }).endsWith(join("deepseek-peak", "schedule.json")));
+    assert.equal(resolveCachePath({ DEEPSEEK_PEAK_CACHE: "/tmp/c.json" }), "/tmp/c.json");
+    assert.ok(resolveCachePath({ DEEPSEEK_PEAK_CACHE: "" }).endsWith("schedule.json"));
+    assert.ok(resolveCachePath({}).endsWith("schedule.json"));
+  });
+
+  it("readCacheFile states", async () => {
+    assert.deepEqual(readCacheFile(join(tmpdir(), `deepseek-peak-nope-${process.pid}.json`)), { status: "missing" });
+    assert.deepEqual(readCacheFile(tmpdir()).status, "invalid");
+    assert.match(readCacheFile(tmpdir()).error, /unreadable/);
+    await writeFile(cacheFile, "not json");
+    assert.match(readCacheFile(cacheFile).error, /not valid JSON/);
+    await writeFile(cacheFile, "5");
+    assert.match(readCacheFile(cacheFile).error, /not an object/);
+    await writeFile(cacheFile, JSON.stringify({ version: 999, schedule: [] }));
+    assert.match(readCacheFile(cacheFile).error, /unsupported version/);
+    await writeFile(cacheFile, JSON.stringify({ version: 1, schedule: [{ days: [9] }] }));
+    assert.match(readCacheFile(cacheFile).error, /bad schedule/);
+    const good = {
+      version: 1,
+      sourceUrl: "u",
+      fetchedAt: "2026-09-14T00:00:00.000Z",
+      excerpt: "e",
+      schedule: [{ days: [1], start: "01:00", end: "02:00" }],
+    };
+    await writeFile(cacheFile, JSON.stringify(good));
+    const back = readCacheFile(cacheFile);
+    assert.equal(back.status, "ok");
+    assert.equal(back.meta.sourceUrl, "u");
+    assert.deepEqual(back.windows, normalizeWindows(good.schedule));
+  });
+
+  it("cacheAgeDays", () => {
+    const now = new Date("2026-09-14T00:00:00.000Z");
+    assert.equal(cacheAgeDays({ fetchedAt: "2026-09-13T00:00:00.000Z" }, now), 1);
+    assert.equal(cacheAgeDays(undefined, now), Infinity);
+    assert.equal(cacheAgeDays({}, now), Infinity);
+    assert.equal(cacheAgeDays({ fetchedAt: "garbage" }, now), Infinity);
+  });
+
+  it("loadScheduleWithMeta precedence", async () => {
+    const fromEnv = loadScheduleWithMeta({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [0], start: "00:00", end: "01:00" }]),
+    });
+    assert.equal(fromEnv.source, "env");
+    const good = {
+      version: 1,
+      fetchedAt: new Date().toISOString(),
+      schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
+    };
+    await writeFile(cacheFile, JSON.stringify(good));
+    const fromCache = loadScheduleWithMeta({ DEEPSEEK_PEAK_CACHE: cacheFile });
+    assert.equal(fromCache.source, "cache");
+    assert.ok(isPeak(new Date("2026-09-14T00:30:00Z"), fromCache.windows));
+    await writeFile(cacheFile, "junk");
+    const fallback = loadScheduleWithMeta({ DEEPSEEK_PEAK_CACHE: cacheFile });
+    assert.equal(fallback.source, "builtin");
+    assert.match(fallback.cacheIssue, /not valid JSON/);
+    const plain = loadScheduleWithMeta({ DEEPSEEK_PEAK_CACHE: join(tmpdir(), `deepseek-peak-nope2-${process.pid}.json`) });
+    assert.equal(plain.source, "builtin");
+    assert.equal(plain.cacheIssue, undefined);
+    assert.ok(Array.isArray(loadSchedule({})));
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "deepseek-peak",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Track DeepSeek API peak/off-peak pricing hours. CLI for humans and scripts, plus an opencode plugin that blocks DeepSeek requests during peak hours and aborts running sessions.",
   "type": "module",
   "bin": {

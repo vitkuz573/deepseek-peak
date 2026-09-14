@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeFile, unlink } from "node:fs/promises";
+import { writeFile, unlink, readFile } from "node:fs/promises";
 import {
   shouldColor,
   createColors,
@@ -17,7 +17,7 @@ import {
   main,
   cmdWait,
 } from "../lib/commands.mjs";
-import { loadSchedule } from "../lib/schedule.mjs";
+import { loadSchedule, readCacheFile } from "../lib/schedule.mjs";
 import { withEnv, peakScheduleNow, offPeakScheduleNow, stubConsole } from "./helpers.mjs";
 
 const FIXED_WINDOWS = loadSchedule({});
@@ -314,6 +314,201 @@ describe("cli.mjs entry point", () => {
       process.argv = prevArgv;
       process.exitCode = prevExitCode;
       cap.restore();
+    }
+  });
+});
+
+describe("main: status schedule source", () => {
+  let cap;
+  const tmpCaches = [];
+  const newCache = () => {
+    const p = join(tmpdir(), `deepseek-peak-src-${process.pid}-${tmpCaches.length}.json`);
+    tmpCaches.push(p);
+    return p;
+  };
+  beforeEach(() => {
+    setColors(createColors(false));
+    cap = stubConsole();
+  });
+  afterEach(() => cap.restore());
+  after(async () => {
+    await Promise.all(tmpCaches.map((p) => unlink(p).catch(() => {})));
+  });
+
+  it("env override", async () => {
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: peakScheduleNow() }, async () => {
+      assert.equal(await main(["status"]), 0);
+      assert.match(cap.logs.join("\n"), /Schedule source: DEEPSEEK_PEAK_SCHEDULE/);
+      cap.logs.length = 0;
+      assert.equal(await main(["status", "--json"]), 0);
+      assert.equal(JSON.parse(cap.logs.at(-1)).schedule.source, "env");
+    });
+  });
+
+  it("fresh, stale and invalid caches", async () => {
+    const fresh = newCache();
+    const stale = newCache();
+    const broken = newCache();
+    await writeFile(
+      fresh,
+      JSON.stringify({
+        version: 1,
+        fetchedAt: new Date().toISOString(),
+        sourceUrl: "u",
+        schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
+      }),
+    );
+    await writeFile(
+      stale,
+      JSON.stringify({
+        version: 1,
+        fetchedAt: "2020-01-01T00:00:00.000Z",
+        sourceUrl: "u",
+        schedule: [{ days: [1], start: "01:00", end: "02:00" }],
+      }),
+    );
+    await writeFile(broken, "junk {{{");
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: fresh }, async () => {
+      assert.equal(await main(["status"]), 0);
+      assert.match(cap.logs.join("\n"), /Schedule source: cache \(fetched /);
+      assert.doesNotMatch(cap.logs.join("\n"), /STALE/);
+      cap.logs.length = 0;
+      assert.equal(await main(["status", "--json"]), 0);
+      const parsed = JSON.parse(cap.logs.at(-1));
+      assert.equal(parsed.schedule.source, "cache");
+      assert.ok(parsed.schedule.meta.fetchedAt);
+    });
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: stale }, async () => {
+      cap.logs.length = 0;
+      assert.equal(await main(["status"]), 0);
+      assert.match(cap.logs.join("\n"), /STALE/);
+    });
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: broken }, async () => {
+      cap.logs.length = 0;
+      assert.equal(await main(["status"]), 0);
+      assert.match(cap.logs.join("\n"), /schedule cache invalid/);
+      cap.logs.length = 0;
+      assert.equal(await main(["status", "--json"]), 0);
+      assert.match(JSON.parse(cap.logs.at(-1)).schedule.cacheIssue, /not valid JSON/);
+    });
+  });
+});
+
+describe("main: sync", () => {
+  let cap;
+  const tmpCaches = [];
+  const newCache = () => {
+    const p = join(tmpdir(), `deepseek-peak-sync-${process.pid}-${tmpCaches.length}.json`);
+    tmpCaches.push(p);
+    return p;
+  };
+  beforeEach(() => {
+    setColors(createColors(false));
+    cap = stubConsole();
+  });
+  afterEach(() => cap.restore());
+  after(async () => {
+    await Promise.all(tmpCaches.map((p) => unlink(p).catch(() => {})));
+  });
+
+  const SAME =
+    "<html><body><p>Peak hours are 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday.</p></body></html>";
+  const CHANGED = "<html><body><p>Peak hours are 02:00 - 05:00 UTC, Monday through Friday.</p></body></html>";
+
+  async function serveSync(handler) {
+    const srv = createServer(handler);
+    await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
+    return {
+      url: `http://127.0.0.1:${srv.address().port}/pricing`,
+      close: () => new Promise((resolve) => srv.close(resolve)),
+    };
+  }
+
+  function htmlServer(html, code = 200) {
+    return serveSync((req, res) => {
+      res.writeHead(code, { "content-type": "text/html" });
+      res.end(html);
+    });
+  }
+
+  it("sync writes cache and reports unchanged", async () => {
+    const { url, close } = await htmlServer(SAME);
+    try {
+      const cache = newCache();
+      assert.equal(await main(["sync", "--url", url, "--cache", cache]), 0);
+      assert.match(cap.logs.join("\n"), /Schedule synced from/);
+      assert.equal(readCacheFile(cache).status, "ok");
+    } finally {
+      await close();
+    }
+  });
+
+  it("sync resolves the default cache path", async () => {
+    const { url, close } = await htmlServer(SAME);
+    const cache = newCache();
+    try {
+      await withEnv({ DEEPSEEK_PEAK_CACHE: cache }, async () => {
+        assert.equal(await main(["sync", "--url", url]), 0);
+        assert.equal(readCacheFile(cache).status, "ok");
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("sync reports changed hours", async () => {
+    const { url, close } = await htmlServer(CHANGED);
+    try {
+      const cache = newCache();
+      assert.equal(await main(["sync", "--url", url, "--cache", cache]), 0);
+      assert.match(cap.logs.join("\n"), /NOTE: this differs/);
+      assert.deepEqual(readCacheFile(cache).windows, [
+        { days: [1, 2, 3, 4, 5], startMin: 120, endMin: 300 },
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("sync --check exits 1 on change, 0 when same", async () => {
+    const same = await htmlServer(SAME);
+    try {
+      assert.equal(await main(["sync", "--check", "--url", same.url, "--cache", newCache()]), 0);
+    } finally {
+      await same.close();
+    }
+    cap.logs.length = 0;
+    const changed = await htmlServer(CHANGED);
+    try {
+      assert.equal(await main(["sync", "--check", "--url", changed.url, "--cache", newCache()]), 1);
+      assert.match(cap.logs.join("\n"), /CHANGED/);
+    } finally {
+      await changed.close();
+    }
+  });
+
+  it("sync --json prints the result", async () => {
+    const { url, close } = await htmlServer(CHANGED);
+    try {
+      assert.equal(await main(["sync", "--json", "--url", url, "--cache", newCache()]), 0);
+      const parsed = JSON.parse(cap.logs.at(-1));
+      assert.equal(parsed.changed, true);
+      assert.equal(parsed.meta.sourceUrl, url);
+    } finally {
+      await close();
+    }
+  });
+
+  it("sync failure exits 2 and leaves cache alone", async () => {
+    const { url, close } = await htmlServer("boom", 500);
+    try {
+      const cache = newCache();
+      await writeFile(cache, "sentinel");
+      assert.equal(await main(["sync", "--url", url, "--cache", cache]), 2);
+      assert.match(cap.errors.join("\n"), /sync failed/);
+      assert.equal(await readFile(cache, "utf8"), "sentinel");
+    } finally {
+      await close();
     }
   });
 });

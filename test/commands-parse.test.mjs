@@ -1,23 +1,21 @@
-import { describe, it, beforeEach, afterEach, before, after } from "node:test";
+import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { writeFile, unlink } from "node:fs/promises";
 import {
   shouldColor,
   createColors,
   setColors,
   nextPeakStart,
   renderStatus,
+  renderSourceLine,
   renderWatchFrame,
   renderDay,
   parseDay,
   parseArgs,
-  main,
+  resolveSyncUrl,
 } from "../lib/commands.mjs";
 import { loadSchedule } from "../lib/schedule.mjs";
-import { withEnv, peakScheduleNow, offPeakScheduleNow, stubConsole } from "./helpers.mjs";
+import { PRICING_URL } from "../lib/sync.mjs";
+import { withEnv, peakScheduleNow, offPeakScheduleNow } from "./helpers.mjs";
 
 const FIXED_WINDOWS = loadSchedule({});
 
@@ -69,13 +67,31 @@ describe("pure renders", () => {
   });
 
   it("renderStatus peak and off-peak", () => {
-    const peak = renderStatus(fixedStatus(true, "offpeak"));
+    const peak = renderStatus(fixedStatus(true, "offpeak"), { source: "builtin" });
     assert.match(peak, /PEAK/);
     assert.match(peak, /Peak ends at 10:00 UTC/);
     assert.match(peak, /Next peak:/);
-    const off = renderStatus(fixedStatus(false, "peak"));
+    assert.match(peak, /Schedule source: built-in defaults/);
+    const off = renderStatus(fixedStatus(false, "peak"), { source: "builtin" });
     assert.match(off, /OFF-PEAK/);
     assert.match(off, /Peak starts at 10:00 UTC/);
+  });
+
+  it("renderSourceLine covers every origin", () => {
+    assert.equal(renderSourceLine({ source: "env" }), "Schedule source: DEEPSEEK_PEAK_SCHEDULE override");
+    assert.match(
+      renderSourceLine({ source: "cache", meta: { fetchedAt: new Date().toISOString() } }),
+      /Schedule source: cache \(fetched /,
+    );
+    assert.doesNotMatch(renderSourceLine({ source: "cache", meta: { fetchedAt: new Date().toISOString() } }), /STALE/);
+    assert.match(renderSourceLine({ source: "cache", meta: { fetchedAt: "2020-01-01T00:00:00.000Z" } }), /STALE/);
+    assert.match(renderSourceLine({ source: "cache", meta: {} }), /unknown fetch date/);
+    assert.match(renderSourceLine({ source: "cache" }), /unknown fetch date/);
+    assert.match(
+      renderSourceLine({ source: "builtin", cacheIssue: "not valid JSON" }),
+      /built-in defaults \(schedule cache invalid/,
+    );
+    assert.match(renderSourceLine({ source: "builtin" }), new RegExp(PRICING_URL.replace(/[.:/]/g, "\\$&")));
   });
 
   it("renderWatchFrame all four state combos", () => {
@@ -133,6 +149,13 @@ describe("parseArgs", () => {
     [["--notify", "https://x"], (o) => assert.equal(o.notify, "https://x")],
     [["--notify=https://x"], (o) => assert.equal(o.notify, "https://x")],
     [["--notify"], (o) => assert.equal(o.notify, null)],
+    [["--url", "https://x"], (o) => assert.equal(o.url, "https://x")],
+    [["--url=https://x"], (o) => assert.equal(o.url, "https://x")],
+    [["--url"], (o) => assert.equal(o.url, null)],
+    [["--cache", "/tmp/c"], (o) => assert.equal(o.cache, "/tmp/c")],
+    [["--cache=/tmp/c"], (o) => assert.equal(o.cache, "/tmp/c")],
+    [["--cache"], (o) => assert.equal(o.cache, null)],
+    [["--check"], (o) => assert.equal(o.check, true)],
     [["--date", "2026-09-19"], (o) => assert.equal(o.date, "2026-09-19")],
     [["--date=2026-09-19"], (o) => assert.equal(o.date, "2026-09-19")],
     [["--date="], (o) => assert.equal(o.date, "")],
@@ -181,6 +204,16 @@ describe("parseArgs", () => {
     assert.throws(() => parseArgs(["--bogus"]), /Unknown flag/);
     assert.throws(() => parseArgs(["bogus-cmd"]), /Unknown command/);
     assert.throws(() => parseArgs(["--for", "x"]), /--for must be/);
+  });
+
+  it("resolveSyncUrl prefers flag, then env, then docs", async () => {
+    assert.equal(resolveSyncUrl({ url: "https://flag.invalid" }), "https://flag.invalid");
+    await withEnv({ DEEPSEEK_PEAK_URL: "https://env.invalid" }, async () => {
+      assert.equal(resolveSyncUrl({ url: null }), "https://env.invalid");
+    });
+    await withEnv({ DEEPSEEK_PEAK_URL: undefined }, async () => {
+      assert.equal(resolveSyncUrl({ url: null }), PRICING_URL);
+    });
   });
 });
 

@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { unlink } from "node:fs/promises";
+import { unlink, writeFile } from "node:fs/promises";
 import { readEvents } from "../lib/ledger.mjs";
 
 const OFFICIAL = "https://api.deepseek.com";
@@ -664,6 +664,90 @@ describe("opencode plugin (synthetic off-peak window)", () => {
       await new Promise((r) => setImmediate(r));
       assert.ok(c2.toasts.some((t) => /off-peak started/.test(t.message)));
       assert.equal(notified.length, seen2);
+    });
+  });
+});
+
+describe("opencode plugin (sync cache schedules)", () => {
+  let plugin;
+
+  const cacheFor = (n) => join(tmpdir(), `deepseek-peak-smoke-cache-${process.pid}-${n}.json`);
+  const caches = [cacheFor(1), cacheFor(2), cacheFor(3)];
+
+  before(async () => {
+    plugin = (await import("../opencode-plugin.ts")).default;
+  });
+
+  after(async () => {
+    await Promise.all(caches.map((p) => unlink(p).catch(() => {})));
+    delete process.env.DEEPSEEK_PEAK_SCHEDULE;
+    delete process.env.DEEPSEEK_PEAK_CACHE;
+  });
+
+  async function writeCache(path, obj) {
+    await writeFile(path, typeof obj === "string" ? obj : JSON.stringify(obj));
+  }
+
+  function peakCacheNow() {
+    const now = new Date();
+    const h = now.getUTCHours();
+    return {
+      version: 1,
+      sourceUrl: "test",
+      fetchedAt: now.toISOString(),
+      excerpt: "test",
+      schedule: [{ days: [now.getUTCDay()], start: `${pad(h)}:00`, end: `${pad((h + 2) % 24)}:00` }],
+    };
+  }
+
+  it("uses the sync cache when present", async () => {
+    await writeCache(caches[0], peakCacheNow());
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[0] }, async () => {
+      const c = newCalls();
+      const h = await plugin({ client: makeClient(c) }, { ledger: false });
+      assert.ok(c.logs.some((l) => /source=cache/.test(l.message)));
+      // Cached hours say peak now (regardless of the real schedule) → official blocks.
+      await assert.rejects(
+        () => h["chat.params"](chatInput("sess-cache", "deepseek-chat", "deepseek", OFFICIAL)),
+        /peak hours/,
+      );
+    });
+  });
+
+  it("warns on a stale cache", async () => {
+    await writeCache(caches[1], {
+      version: 1,
+      fetchedAt: "2020-01-01T00:00:00.000Z",
+      schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
+    });
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[1] }, async () => {
+      const c = newCalls();
+      await plugin({ client: makeClient(c) }, { ledger: false });
+      const warn = c.logs.find((l) => /older than 30 days/.test(l.message));
+      assert.ok(warn);
+      assert.equal(warn.level, "warn");
+    });
+  });
+
+  it("warns on a dateless cache (unknown age counts as stale)", async () => {
+    await writeCache(caches[2], {
+      version: 1,
+      schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
+    });
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[2] }, async () => {
+      const c = newCalls();
+      await plugin({ client: makeClient(c) }, { ledger: false });
+      assert.ok(c.logs.some((l) => /unknown/.test(l.message)));
+    });
+  });
+
+  it("warns on an invalid cache and falls back to built-in", async () => {
+    await writeCache(caches[2], "junk {{{");
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[2] }, async () => {
+      const c = newCalls();
+      await plugin({ client: makeClient(c) }, { ledger: false });
+      assert.ok(c.logs.some((l) => /source=builtin/.test(l.message)));
+      assert.ok(c.logs.some((l) => /cache ignored/.test(l.message)));
     });
   });
 });
