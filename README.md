@@ -70,11 +70,16 @@ Format: JSON array of `{"days":[0..6, Sun..Sat],"start":"HH:MM","end":"HH:MM"}`
 
 ## opencode plugin
 
-Registered globally in `~/.config/opencode/opencode.jsonc`:
+Clone the repo, then register the plugin globally — either copy
+`opencode-plugin.ts` plus the `lib/` directory into
+`~/.config/opencode/plugins/` (keeping their relative layout, so the
+`./lib/schedule.mjs` import keeps resolving; files directly under
+`plugins/` are auto-loaded), or reference it by path in
+`~/.config/opencode/opencode.jsonc`:
 
 ```jsonc
 "plugin": [
-  ["file:///home/vitaly/projects/deepseek-peak/opencode-plugin.ts",
+  ["file:///path/to/deepseek-peak/opencode-plugin.ts",
    { "mode": "block", "abortOnPeak": true }]
 ]
 ```

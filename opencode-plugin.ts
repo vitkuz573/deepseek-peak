@@ -9,9 +9,15 @@
 // is off-peak. Source: https://api-docs.deepseek.com/quick_start/pricing
 // The schedule can be overridden with DEEPSEEK_PEAK_SCHEDULE (see lib/schedule.mjs).
 //
-// Installation (global): add to ~/.config/opencode/opencode.jsonc:
+// Installation (global).
+// Option A — drop-in, no config edit needed: copy opencode-plugin.ts plus the
+// lib/ directory into ~/.config/opencode/plugins/, keeping their relative
+// layout (plugins/deepseek-peak.ts + plugins/lib/schedule.mjs), so the
+// relative import of ./lib/schedule.mjs keeps resolving. Files directly
+// under plugins/ are auto-loaded.
+// Option B — reference by path in ~/.config/opencode/opencode.jsonc:
 //   "plugin": [
-//     ["file:///home/vitaly/projects/deepseek-peak/opencode-plugin.ts", { "mode": "block" }]
+//     ["file:///path/to/deepseek-peak/opencode-plugin.ts", { "mode": "block" }]
 //   ]
 // Then restart opencode (config and plugins load once at startup).
 //
