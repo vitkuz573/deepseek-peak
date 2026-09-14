@@ -34,7 +34,7 @@ Commands:
 | `status` (default) | One-shot status with countdowns. `--json` for machines. |
 | `day [--date YYYY-MM-DD]` | 24h peak/off-peak timeline with a now-marker (default: today, UTC). |
 | `report [options]` | Totals from the plugin event ledger; `--estimate` adds rough $ savings. |
-| `watch` | Live countdown, refreshed every second (Ctrl+C to exit). |
+| `watch` | Live countdown, refreshed every second (Ctrl+C to exit). `--frames N` renders N frames and exits (snapshots). |
 | `is-peak [--json]` | Exit `1` during peak, `0` off-peak. For shell scripts / CI. |
 | `next [--unix] [--json]` | Print the next schedule transition. |
 | `wait [options]` | Block until peak/off-peak hours start. |
@@ -136,9 +136,17 @@ Restart opencode after changing config or the plugin file (loaded once at startu
 
 What it does:
 
-- **`chat.params` hook** — before every LLM call, if the model looks like
-  DeepSeek (matched case-insensitively against provider/model id and name,
-  so `neutralbeats-chat/deepseek-v4.1-flash` is covered) **and** it is peak:
+- **Endpoint-first matching** — peak pricing applies ONLY to DeepSeek's
+  official API, so the plugin checks where the request actually goes
+  (`provider.options.baseURL`, e.g. `api.deepseek.com` vs a flat-rate
+  proxy like `api.neutralbeats.com`), not just the model name:
+  - `matchMode: "endpoint"` (default) — guard official-endpoint traffic.
+    Known proxies always pass; an unknown endpoint falls back to name
+    matching (conservative).
+  - `matchMode: "name"` — match by provider/model id and name only.
+  - `matchMode: "both"` — guard when either rule hits (most conservative).
+- **`chat.params` hook** — before every LLM call, if the request is guarded
+  (see above) **and** it is peak:
   - `mode: "block"` (default) — throws, the request never reaches the API.
     The error tells you when off-peak starts and how to relax the guard.
   - `mode: "warn"` — lets the request through, shows a warning toast.
@@ -166,6 +174,7 @@ Options (second tuple element) and ENV overrides:
 | `toast` | `true` | `DEEPSEEK_PEAK_TOAST=0` |
 | `log` | `true` | `DEEPSEEK_PEAK_LOG=0` |
 | `match: string[]` | `[]` | — (extra substrings treated as DeepSeek) |
+| `matchMode` | `"endpoint"` | `DEEPSEEK_PEAK_MATCH` (`endpoint`/`name`/`both`) |
 | `warnBeforeMin` | `10` | `DEEPSEEK_PEAK_WARN_BEFORE` (0 disables) |
 | `ledger: bool \| path` | `true` | `DEEPSEEK_PEAK_LEDGER` (path, or 0 to disable) |
 | `notifyUrl` | `""` | `DEEPSEEK_PEAK_NOTIFY_URL` |
@@ -175,27 +184,36 @@ Options (second tuple element) and ENV overrides:
 
 ```sh
 npm install        # dev deps for typecheck (typescript, plugin types)
-npm test           # node --test: schedule unit tests + plugin smoke test
+npm test           # node --test: unit + plugin smoke + CLI tests
+npm run coverage   # same suite with a 100% lines/branches/functions gate
 npm run typecheck  # tsc --noEmit
 ```
 
 `test/plugin.smoke.mjs` drives the real plugin with a mocked opencode
 client and a synthetic peak window around "now", so it passes at any hour:
-block on model/provider match, pass-through for other models, warn mode,
-and abort-selection at the peak transition.
+endpoint/name matching, block/pass behavior, warn mode, abort-selection at
+the peak transition, ledger writes, and notification POSTs.
+`test/commands-*.test.mjs` drive every CLI command in-process with
+synthetic schedules (deterministic at any hour).
 
 ## Files
 
 ```
 deepseek-peak/
   lib/schedule.mjs      schedule core (UTC, no deps)
+  lib/match.mjs         endpoint-first DeepSeek matching (official API vs proxies)
   lib/ledger.mjs        JSONL ledger: append/read/summarize/savings estimate
   lib/notify.mjs        best-effort JSON POST alerts (ntfy/webhooks)
-  cli.mjs               CLI (status/day/report/watch/wait/next/is-peak)
+  lib/commands.mjs      all CLI logic (import-safe; cli.mjs is a 3-line entry)
+  cli.mjs               CLI entry point (status/day/report/watch/wait/next/is-peak)
   opencode-plugin.ts    opencode plugin (type-only external import)
   test/schedule.test.mjs
+  test/match.test.mjs
   test/ledger.test.mjs
   test/notify.test.mjs
+  test/commands-parse.test.mjs   pure renders, arg parsing
+  test/commands-run.test.mjs     every command end-to-end in-process
   test/plugin.smoke.mjs
+  test/helpers.mjs               synthetic schedules, env/console helpers
   package.json / tsconfig.json / README.md
 ```

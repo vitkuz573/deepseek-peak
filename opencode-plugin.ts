@@ -1,9 +1,11 @@
 // deepseek-peak — opencode plugin.
 //
-// Blocks DeepSeek API requests during peak pricing hours and aborts
-// already-running DeepSeek sessions the moment peak hours begin, so you
-// never pay the 2x peak rates by accident. Off-peak requests pass through
-// untouched.
+// Blocks requests billed through DeepSeek's official API during peak pricing
+// hours, and aborts already-running official-API sessions the moment peak
+// begins, so you never pay the 2x peak rates by accident. Off-peak requests
+// pass through untouched — and so does anything served by a flat-rate proxy
+// or mirror, because peak pricing applies ONLY to api.deepseek.com.
+// Matching is endpoint-first (see lib/match.mjs).
 //
 // Peak schedule (UTC): Mon–Fri 01:00–04:00 and 06:00–10:00, everything else
 // is off-peak. Source: https://api-docs.deepseek.com/quick_start/pricing
@@ -33,8 +35,14 @@
 //                   ENV: DEEPSEEK_PEAK_TOAST=0 to disable
 //   log             write to the opencode log via client.app.log (default true).
 //                   ENV: DEEPSEEK_PEAK_LOG=0 to disable
-//   match           extra case-insensitive substrings to treat as DeepSeek,
-//                   matched against provider/model id and name, e.g. ["my-proxy"].
+//   match           extra case-insensitive name substrings treated as DeepSeek,
+//                   e.g. ["my-proxy"]. Feeds the name rule (mode "name" and
+//                   "both", plus the unknown-endpoint fallback).
+//   matchMode       "endpoint" (default): guard official-endpoint traffic;
+//                   known proxies always pass, unknown endpoints fall back
+//                   to name matching. "name": match by id/name only.
+//                   "both": guard when either rule hits.
+//                   ENV: DEEPSEEK_PEAK_MATCH
 //   warnBeforeMin   heads-up toast N minutes before each transition (default 10,
 //                   0 disables). ENV: DEEPSEEK_PEAK_WARN_BEFORE
 //   ledger          append every block/abort/transition to a JSONL ledger for
@@ -57,6 +65,7 @@ import {
 } from "./lib/schedule.mjs";
 import { resolveLedgerPath, appendEvent } from "./lib/ledger.mjs";
 import { notify } from "./lib/notify.mjs";
+import { shouldGuardDeepSeek, hostOf } from "./lib/match.mjs";
 
 export type DeepSeekPeakOptions = {
   disabled?: boolean;
@@ -66,6 +75,7 @@ export type DeepSeekPeakOptions = {
   toast?: boolean;
   log?: boolean;
   match?: string[];
+  matchMode?: "endpoint" | "name" | "both";
   warnBeforeMin?: number;
   ledger?: boolean | string;
   notifyUrl?: string;
@@ -79,6 +89,7 @@ type ResolvedOptions = {
   toast: boolean;
   log: boolean;
   match: string[];
+  matchMode: "endpoint" | "name" | "both";
   warnBeforeMin: number;
   ledger: boolean | string;
   notifyUrl: string;
@@ -104,6 +115,11 @@ function resolveOptions(raw?: Record<string, unknown>): ResolvedOptions {
   const env = process.env;
   const modeRaw = typeof raw?.mode === "string" ? raw.mode : env.DEEPSEEK_PEAK_MODE;
   const ledgerRaw = raw?.ledger;
+  const matchModeRaw = typeof raw?.matchMode === "string" ? raw.matchMode : env.DEEPSEEK_PEAK_MATCH;
+  let matchMode: "endpoint" | "name" | "both" = "endpoint";
+  if (matchModeRaw === "endpoint" || matchModeRaw === "name" || matchModeRaw === "both") {
+    matchMode = matchModeRaw;
+  }
   return {
     disabled: boolOpt(raw?.disabled) ?? boolOpt(env.DEEPSEEK_PEAK_DISABLE) ?? false,
     mode: String(modeRaw ?? "").toLowerCase() === "warn" ? "warn" : "block",
@@ -114,6 +130,7 @@ function resolveOptions(raw?: Record<string, unknown>): ResolvedOptions {
     match: Array.isArray(raw?.match)
       ? (raw.match as unknown[]).filter((m: unknown): m is string => typeof m === "string" && m.length > 0)
       : [],
+    matchMode,
     warnBeforeMin: Math.max(0, numOpt(raw?.warnBeforeMin) ?? numOpt(env.DEEPSEEK_PEAK_WARN_BEFORE) ?? 10),
     ledger:
       typeof ledgerRaw === "string" || typeof ledgerRaw === "boolean" ? ledgerRaw : true,
@@ -129,10 +146,13 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
   if (opts.disabled) return {};
 
   const windows = loadSchedule();
-  const needles = ["deepseek", ...opts.match.map((m) => m.toLowerCase())];
-  // Last model seen per session (from chat.params) + sessions currently busy
-  // (from session.status events). Used to abort DeepSeek sessions at peak start.
-  const sessionModels = new Map<string, { providerID: string; model: string }>();
+  // Last endpoint info seen per session (from chat.params) + sessions currently
+  // busy (from session.status events). Used to abort official-API sessions when
+  // peak begins.
+  const sessionModels = new Map<
+    string,
+    { providerID: string; providerName: string; baseURL: string; modelId: string; modelName: string }
+  >();
   const busySessions = new Set<string>();
   const ledgerPath = resolveLedgerPath(opts.ledger);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -158,11 +178,6 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
     } catch {
       // No TUI attached (headless run, remote client, …) — not fatal.
     }
-  };
-
-  const isDeepSeek = (parts: Array<string | undefined>): boolean => {
-    const hay = parts.filter((p): p is string => !!p).map((p) => p.toLowerCase());
-    return needles.some((n) => hay.some((h) => h.includes(n)));
   };
 
   const onTransition = async (): Promise<void> => {
@@ -198,7 +213,10 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
     if (opts.abortOnPeak) {
       for (const id of busy) {
         const rec = sessionModels.get(id);
-        const matched = !rec || isDeepSeek([rec.providerID, rec.model]);
+        // Sessions we never saw (started before the plugin loaded) are
+        // aborted conservatively; known proxies are left alone.
+        const matched =
+          !rec || shouldGuardDeepSeek(rec, { mode: opts.matchMode, extraNeedles: opts.match }).guard;
         if (!matched && !opts.abortAllOnPeak) {
           skipped.push(id);
           continue;
@@ -208,10 +226,11 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
           if (ok === false) skipped.push(id);
           else {
             aborted.push(id);
-            void appendEvent(ledgerPath, {
+            await appendEvent(ledgerPath, {
               type: "aborted",
               session: id,
-              model: sessionModels.get(id)?.model ?? "unknown",
+              model: rec ? `${rec.providerID}/${rec.modelId}` : "unknown",
+              endpoint: rec ? hostOf(rec.baseURL) || "unknown" : "unknown",
             });
           }
         } catch {
@@ -255,27 +274,19 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
     timer = undefined;
     if (warnTimer) clearTimeout(warnTimer);
     warnTimer = undefined;
-    let t: { at: Date; inMs: number };
-    try {
-      t = nextTransition(new Date(), windows);
-    } catch {
-      return;
-    }
+    // nextTransition cannot throw here: windows come from loadSchedule, which
+    // only returns normalized non-empty schedules, and every weekday occurs
+    // within the scanned 9-day span — so a future boundary always exists.
+    const t = nextTransition(new Date(), windows);
+    // unref is load-bearing: without it, a non-interactive `opencode run`
+    // would hang until the next transition instead of exiting after answering.
     timer = setTimeout(() => void onTransition(), Math.min(Math.max(t.inMs, 1000), 2_147_483_647));
-    try {
-      (timer as unknown as { unref?: () => void }).unref?.();
-    } catch {
-      // unref unsupported — harmless.
-    }
+    timer.unref();
     if (opts.warnBeforeMin > 0) {
       const delay = t.at.getTime() - opts.warnBeforeMin * 60000 - Date.now();
       if (delay > 1000) {
         warnTimer = setTimeout(() => void onWarn(), Math.min(delay, 2_147_483_647));
-        try {
-          (warnTimer as unknown as { unref?: () => void }).unref?.();
-        } catch {
-          // unref unsupported — harmless.
-        }
+        warnTimer.unref();
       }
     }
   }
@@ -283,7 +294,7 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
   const s0 = status(new Date(), windows);
   await log(
     "info",
-    `deepseek-peak active (mode=${opts.mode}, abortOnPeak=${opts.abortOnPeak}, ` +
+    `deepseek-peak active (mode=${opts.mode}, match=${opts.matchMode}, abortOnPeak=${opts.abortOnPeak}, ` +
       `warnBeforeMin=${opts.warnBeforeMin}, ledger=${ledgerPath ?? "off"}, notify=${opts.notifyUrl ? "on" : "off"}). ` +
       `Now: ${s0.peak ? "PEAK" : "OFF-PEAK"}; next change: ${s0.transition.to} at ` +
       `${formatTimeUTC(s0.transition.at)} (in ${formatDuration(s0.transition.inMs)}).`,
@@ -292,32 +303,40 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
 
   return {
     "chat.params": async (input) => {
-      const modelId = input.model?.id ?? "";
-      const modelName = input.model?.name ?? "";
-      const providerID = input.model?.providerID ?? input.provider?.info?.id ?? "";
-      const providerName = input.provider?.info?.name ?? "";
-      sessionModels.set(input.sessionID, { providerID, model: `${modelId} ${modelName}`.trim() });
+      const modelId = input.model.id;
+      const modelName = input.model.name;
+      const providerID = input.model.providerID;
+      // NOTE: `provider.info` is typed as required but is undefined at runtime
+      // for some providers (observed live) — hence the optional chaining.
+      const providerName = input.provider.info?.name ?? "";
+      const baseURL = input.provider.options?.baseURL ?? "";
+      const info = { providerID, providerName, baseURL, modelId, modelName };
+      sessionModels.set(input.sessionID, info);
       armTimer(); // re-arm on activity: heals the schedule after sleep/suspend
-      if (!isDeepSeek([providerID, providerName, modelId, modelName])) return;
+      const verdict = shouldGuardDeepSeek(info, { mode: opts.matchMode, extraNeedles: opts.match });
+      if (!verdict.guard) return;
       const now = new Date();
       if (!isPeak(now, windows)) return;
       const s = status(now, windows);
       const label = `${providerID || "?"}/${modelId || "?"}`;
+      const endpoint = hostOf(baseURL) || "unknown";
       if (opts.mode === "warn") {
-        await appendEvent(ledgerPath, { type: "allowed-warn", session: input.sessionID, model: label });
+        await appendEvent(ledgerPath, { type: "allowed-warn", session: input.sessionID, model: label, endpoint, reason: verdict.reason });
         await toast(`DeepSeek peak hours: ${label} bills at 2x rates until ${formatClockUTC(s.transition.at)}.`, "warning");
         await log("warn", `Peak-hour request to ${label} allowed (mode=warn), session ${input.sessionID}.`);
         return;
       }
       const message = [
         `DeepSeek peak hours — request blocked by the deepseek-peak plugin.`,
-        `Model: ${label}. Peak windows (UTC): ${describeWindows(windows)} — standard (2x) rates apply right now.`,
+        verdict.reason === "endpoint"
+          ? `Model: ${label} via ${endpoint} (official API). Peak windows (UTC): ${describeWindows(windows)} — standard (2x) rates apply right now.`
+          : `Model: ${label} (endpoint ${endpoint}, matched by name). Peak windows (UTC): ${describeWindows(windows)} — standard (2x) rates apply right now.`,
         `Off-peak starts at ${formatClockUTC(s.transition.at)} (in ${formatDuration(s.transition.inMs)}), rates drop to 0.5x.`,
         `Options: switch to a non-DeepSeek model, wait for off-peak, or relax the guard with`,
         `the plugin option mode:"warn" or the DEEPSEEK_PEAK_MODE=warn environment variable.`,
       ].join("\n");
-      await appendEvent(ledgerPath, { type: "blocked", session: input.sessionID, model: label });
-      await toast(`Blocked DeepSeek request to ${label}: peak hours until ${formatClockUTC(s.transition.at)}.`, "warning");
+      await appendEvent(ledgerPath, { type: "blocked", session: input.sessionID, model: label, endpoint, reason: verdict.reason });
+      await toast(`Blocked DeepSeek request to ${label} (${endpoint}): peak hours until ${formatClockUTC(s.transition.at)}.`, "warning");
       await log("warn", `Blocked peak-hour request to ${label}, session ${input.sessionID}.`);
       throw new Error(message);
     },

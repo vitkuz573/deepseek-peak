@@ -4,9 +4,12 @@ import {
   DEFAULT_WINDOWS,
   loadSchedule,
   isPeak,
+  windowAt,
   nextTransition,
   status,
   formatDuration,
+  describeWindows,
+  formatTimeLocal,
   dayCells,
 } from "../lib/schedule.mjs";
 
@@ -119,6 +122,26 @@ describe("loadSchedule", () => {
     // the window tail belongs to the next day
     assert.equal(isPeak(D("2026-09-15T01:00:00Z"), w), true);
     assert.equal(isPeak(D("2026-09-15T02:00:00Z"), w), false);
+    assert.equal(isPeak(D("2026-09-16T01:00:00Z"), w), false); // Wed: prev day not a window day
+  });
+
+  it("overnight transitions include the tail end", () => {
+    const w = loadSchedule({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [1], start: "22:00", end: "02:00" }]),
+    });
+    // Mon 2026-09-14, Tue 2026-09-15, next Mon 2026-09-21.
+    let t = nextTransition(D("2026-09-14T21:00:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-14T22:00:00.000Z");
+    assert.equal(t.to, "peak");
+    t = nextTransition(D("2026-09-14T23:00:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-15T02:00:00.000Z");
+    assert.equal(t.to, "offpeak");
+    t = nextTransition(D("2026-09-15T01:00:00Z"), w); // inside the tail
+    assert.equal(t.at.toISOString(), "2026-09-15T02:00:00.000Z");
+    assert.equal(t.to, "offpeak");
+    t = nextTransition(D("2026-09-15T03:00:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-21T22:00:00.000Z");
+    assert.equal(t.to, "peak");
   });
 });
 
@@ -146,5 +169,72 @@ describe("dayCells", () => {
 
   it("rejects bad granularity", () => {
     assert.throws(() => dayCells(D("2026-09-14T00:00:00Z"), W, 0), /slotsPerHour/);
+  });
+});
+
+describe("normalizeWindows validation", () => {
+  it("rejects garbage schedules", () => {
+    assert.throws(() => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: "[]" }), /non-empty array/);
+    assert.throws(() => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: "{}" }), /non-empty array/);
+    assert.throws(() => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{}]) }), /"days"/);
+    assert.throws(() => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [] }]) }), /"days"/);
+    assert.throws(() => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [7] }]) }), /bad day/);
+    assert.throws(
+      () => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [1], start: "x", end: "02:00" }]) }),
+      /Bad clock/,
+    );
+    assert.throws(
+      () => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([{ days: [1], start: "25:00", end: "02:00" }]) }),
+      /Bad clock/,
+    );
+  });
+});
+
+describe("raw (non-normalized) windows", () => {
+  it("work everywhere normalized ones do", () => {
+    const raw = DEFAULT_WINDOWS;
+    assert.equal(isPeak(D("2026-09-14T02:00:00Z"), raw), true);
+    assert.equal(isPeak(D("2026-09-14T12:00:00Z"), raw), false);
+    assert.ok(windowAt(D("2026-09-14T02:00:00Z"), raw));
+    assert.equal(windowAt(D("2026-09-14T12:00:00Z"), raw), null);
+    assert.equal(status(D("2026-09-14T02:00:00Z"), raw).peak, true);
+    assert.equal(nextTransition(D("2026-09-14T00:30:00Z"), raw).to, "peak");
+    assert.match(describeWindows(raw), /Mon–Fri/);
+    assert.equal(dayCells(D("2026-09-14T00:00:00Z"), raw).length, 48);
+  });
+
+  it("rejects empty and non-array input", () => {
+    assert.throws(() => isPeak(D("2026-09-14T00:00:00Z"), []), /non-empty array/);
+    assert.throws(() => isPeak(D("2026-09-14T00:00:00Z"), "nope"), /non-empty array/);
+  });
+
+  it("a schedule with no valid day has no transitions", () => {
+    assert.throws(
+      () => nextTransition(D("2026-09-14T00:00:00Z"), [{ days: [99], startMin: 0, endMin: 60 }]),
+      /No upcoming transition/,
+    );
+  });
+});
+
+describe("describeWindows variants", () => {
+  const w = (json) => loadSchedule({ DEEPSEEK_PEAK_SCHEDULE: JSON.stringify(json) });
+  it("daily, weekends, single days and overnight marks", () => {
+    assert.match(describeWindows(w([{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }])), /daily/);
+    assert.match(describeWindows(w([{ days: [0, 6], start: "12:00", end: "13:00" }])), /weekends/);
+    assert.match(describeWindows(w([{ days: [3], start: "12:00", end: "13:00" }])), /Wed/);
+    assert.match(describeWindows(w([{ days: [5], start: "22:00", end: "02:00" }])), /\(\+1 day\)/);
+  });
+});
+
+describe("local time formatting", () => {
+  it("covers both sides of UTC", () => {
+    const d = new Date("2026-09-14T09:06:38Z");
+    assert.match(formatTimeLocal(d), /UTC[+-]\d{2}:\d{2}/);
+    const west = new Date("2026-09-14T09:06:38Z");
+    west.getTimezoneOffset = () => 300; // UTC-05:00
+    assert.match(formatTimeLocal(west), /\(UTC-05:00\)/);
+    const east = new Date("2026-09-14T09:06:38Z");
+    east.getTimezoneOffset = () => -330; // UTC+05:30
+    assert.match(formatTimeLocal(east), /\(UTC\+05:30\)/);
   });
 });
