@@ -1,0 +1,22 @@
+{
+  "name": "deepseek-peak",
+  "version": "0.1.0",
+  "description": "Track DeepSeek API peak/off-peak pricing hours. CLI for humans and scripts, plus an opencode plugin that blocks DeepSeek requests during peak hours and aborts running sessions.",
+  "type": "module",
+  "bin": {
+    "deepseek-peak": "./cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.mjs",
+    "status": "node ./cli.mjs status",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
