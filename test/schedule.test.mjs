@@ -321,3 +321,64 @@ describe("schedule cache", () => {
     assert.ok(Array.isArray(loadSchedule({})));
   });
 });
+
+describe("overlapping windows", () => {
+  // Mon 2026-09-14, Tue 2026-09-15, next Mon 2026-09-21.
+  const overlapping = () =>
+    loadSchedule({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([
+        { days: [1], start: "01:00", end: "04:00" },
+        { days: [1], start: "02:00", end: "03:00" },
+      ]),
+    });
+
+  it("skips inner boundaries that change nothing", () => {
+    const w = overlapping();
+    let t = nextTransition(D("2026-09-14T00:30:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-14T01:00:00.000Z");
+    assert.equal(t.to, "peak");
+    t = nextTransition(D("2026-09-14T02:30:00Z"), w); // inside both windows
+    assert.equal(t.at.toISOString(), "2026-09-14T04:00:00.000Z"); // not 03:00!
+    assert.equal(t.to, "offpeak");
+    t = nextTransition(D("2026-09-14T03:30:00Z"), w); // inside the outer window only
+    assert.equal(t.at.toISOString(), "2026-09-14T04:00:00.000Z");
+    assert.equal(t.to, "offpeak");
+    t = nextTransition(D("2026-09-14T04:30:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-21T01:00:00.000Z");
+    assert.equal(t.to, "peak");
+  });
+
+  it("adjacent windows merge into one peak stretch", () => {
+    const w = loadSchedule({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([
+        { days: [1], start: "01:00", end: "02:00" },
+        { days: [1], start: "02:00", end: "03:00" },
+      ]),
+    });
+    const t = nextTransition(D("2026-09-14T01:30:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-14T03:00:00.000Z"); // not 02:00!
+    assert.equal(t.to, "offpeak");
+  });
+
+  it("duplicate windows behave like one", () => {
+    const w = loadSchedule({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([
+        { days: [1], start: "01:00", end: "02:00" },
+        { days: [1], start: "01:00", end: "02:00" },
+      ]),
+    });
+    const t = nextTransition(D("2026-09-14T00:30:00Z"), w);
+    assert.equal(t.at.toISOString(), "2026-09-14T01:00:00.000Z");
+    assert.equal(t.to, "peak");
+  });
+
+  it("24/7 peak has no transitions and fails loud", () => {
+    const w = loadSchedule({
+      DEEPSEEK_PEAK_SCHEDULE: JSON.stringify([
+        { days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "00:00" },
+      ]),
+    });
+    assert.equal(isPeak(D("2026-09-14T12:00:00Z"), w), true);
+    assert.throws(() => nextTransition(D("2026-09-14T12:00:00Z"), w), /No upcoming transition/);
+  });
+});
