@@ -5,7 +5,9 @@
 // begins, so you never pay the 2x peak rates by accident. Off-peak requests
 // pass through untouched — and so does anything served by a flat-rate proxy
 // or mirror, because peak pricing applies ONLY to api.deepseek.com.
-// Matching is endpoint-first (see lib/match.mjs).
+// Matching is endpoint-first (see lib/match.mjs): an explicit
+// provider.options.baseURL wins, else the model's canonical api.url is used
+// (the built-in deepseek provider ships no baseURL — only model.api.url).
 //
 // Peak schedule (UTC): Mon–Fri 01:00–04:00 and 06:00–10:00, everything else
 // is off-peak. Source: https://api-docs.deepseek.com/quick_start/pricing
@@ -68,7 +70,7 @@ import {
 import { STALE_AFTER_DAYS } from "./lib/sync.mjs";
 import { resolveLedgerPath, appendEvent } from "./lib/ledger.mjs";
 import { notify } from "./lib/notify.mjs";
-import { shouldGuardDeepSeek, hostOf } from "./lib/match.mjs";
+import { shouldGuardDeepSeek, hostOf, endpointOf } from "./lib/match.mjs";
 
 export type DeepSeekPeakOptions = {
   disabled?: boolean;
@@ -155,7 +157,7 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
   // peak begins.
   const sessionModels = new Map<
     string,
-    { providerID: string; providerName: string; baseURL: string; modelId: string; modelName: string }
+    { providerID: string; providerName: string; baseURL: string; apiURL: string; modelId: string; modelName: string }
   >();
   const busySessions = new Set<string>();
   const ledgerPath = resolveLedgerPath(opts.ledger);
@@ -234,7 +236,7 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
               type: "aborted",
               session: id,
               model: rec ? `${rec.providerID}/${rec.modelId}` : "unknown",
-              endpoint: rec ? hostOf(rec.baseURL) || "unknown" : "unknown",
+              endpoint: rec ? hostOf(rec.baseURL || rec.apiURL) || "unknown" : "unknown",
             });
           }
         } catch {
@@ -323,11 +325,28 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
       const modelId = input.model.id;
       const modelName = input.model.name;
       const providerID = input.model.providerID;
-      // NOTE: `provider.info` is typed as required but is undefined at runtime
-      // for some providers (observed live) — hence the optional chaining.
-      const providerName = input.provider.info?.name ?? "";
-      const baseURL = input.provider.options?.baseURL ?? "";
-      const info = { providerID, providerName, baseURL, modelId, modelName };
+      // Runtime shape note: current opencode passes a flat Provider.Info
+      // ({ id, name, options, … }) here, while @opencode-ai/plugin types it
+      // as a wrapped ProviderContext ({ info, options }). Older runtimes
+      // (and some providers) omit pieces — see providerBaseURL().
+      const provider = input.provider as unknown as {
+        id?: string;
+        name?: string;
+        options?: Record<string, unknown>;
+        info?: { id?: string; name?: string; options?: Record<string, unknown> };
+      };
+      const providerName =
+        (typeof provider?.info?.name === "string" && provider.info.name) ||
+        (typeof provider?.name === "string" && provider.name) ||
+        "";
+      // Effective billing endpoint: explicit provider baseURL wins, else the
+      // model's canonical api.url (models.dev default). The built-in deepseek
+      // provider ships no options.baseURL — only model.api.url, so reading
+      // options alone yields "unknown" and mislabels official traffic.
+      const modelWithApi = input.model as unknown as { api?: { url?: string } };
+      const apiURL = modelWithApi?.api?.url ?? "";
+      const baseURL = endpointOf(provider, input.model as unknown as { api?: { url?: unknown } });
+      const info = { providerID, providerName, baseURL, apiURL, modelId, modelName };
       sessionModels.set(input.sessionID, info);
       armTimer(); // re-arm on activity: heals the schedule after sleep/suspend
       const verdict = shouldGuardDeepSeek(info, { mode: opts.matchMode, extraNeedles: opts.match });

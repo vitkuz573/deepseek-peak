@@ -107,15 +107,43 @@ function newCalls() {
   return { logs: [], toasts: [], aborts: [] };
 }
 
-function chatInput(sessionID, modelID, providerID, baseURL) {
+function chatInput(sessionID, modelID, providerID, baseURL, apiURL) {
   return {
     sessionID,
     agent: "build",
-    model: { id: modelID, name: modelID, providerID },
+    model: {
+      id: modelID,
+      name: modelID,
+      providerID,
+      ...(apiURL === undefined ? {} : { api: { id: modelID, url: apiURL } }),
+    },
     provider: {
       source: "config",
       info: { id: providerID, name: providerID },
       options: baseURL === undefined ? {} : { baseURL },
+    },
+    message: {},
+  };
+}
+
+/** Live runtime shape: flat Provider.Info (id/name/options top-level), no .info wrapper. */
+function flatChatInput(sessionID, modelID, providerID, baseURL, apiURL) {
+  return {
+    sessionID,
+    agent: "build",
+    model: {
+      id: modelID,
+      name: modelID,
+      providerID,
+      ...(apiURL === undefined ? {} : { api: { id: modelID, url: apiURL } }),
+    },
+    provider: {
+      id: providerID,
+      name: providerID,
+      source: "config",
+      env: [],
+      options: baseURL === undefined ? {} : { baseURL },
+      models: {},
     },
     message: {},
   };
@@ -184,6 +212,23 @@ describe("opencode plugin (synthetic peak window)", () => {
     );
   });
 
+  it("blocks the built-in deepseek provider via model.api.url (no options.baseURL)", async () => {
+    // Live shape: flat Provider.Info with empty options; the endpoint comes
+    // from model.api.url (https://api.deepseek.com in models.dev).
+    await assert.rejects(
+      () => hooks["chat.params"](flatChatInput("sess-live", "deepseek-flash", "deepseek", undefined, OFFICIAL)),
+      /official API/,
+    );
+    // A custom proxy baseURL still wins over an official-looking api.url.
+    await hooks["chat.params"](flatChatInput("sess-live-proxy", "deepseek-flash", "deepseek", PROXY, OFFICIAL));
+  });
+
+  it("reads the provider name from the flat Provider.Info shape", async () => {
+    const input = flatChatInput("sess-flatname", "some-model", "my-proxy", undefined, undefined);
+    input.provider.name = "DeepSeek mirror";
+    await assert.rejects(() => hooks["chat.params"](input), /matched by name/);
+  });
+
   it("passes DeepSeek models on a flat-rate proxy", async () => {
     await hooks["chat.params"](chatInput("sess-proxy", "deepseek-v4.1-flash", "neutralbeats-chat", PROXY));
   });
@@ -250,6 +295,15 @@ describe("opencode plugin (synthetic peak window)", () => {
     await hooks["chat.params"](bareChatInput("sess-bare2", "some-model", "somewhere"));
   });
 
+  it("survives model without api.url (observed live)", async () => {
+    // Flat provider, no options.baseURL, model without api — name fallback.
+    await assert.rejects(
+      () => hooks["chat.params"](flatChatInput("sess-noapi", "deepseek-chat", "deepseek")),
+      /matched by name/,
+    );
+    await hooks["chat.params"](flatChatInput("sess-noapi2", "some-model", "somewhere"));
+  });
+
   it("survives info without a name", async () => {
     const input = chatInput("sess-noname", "deepseek-chat", "deepseek", OFFICIAL);
     input.provider.info = {};
@@ -291,6 +345,20 @@ describe("opencode plugin (synthetic peak window)", () => {
     assert.equal(events[0].reason, "endpoint");
   });
 
+  it("writes api.url-resolved blocks to the ledger with the official host", async () => {
+    const ledgerCalls = newCalls();
+    const ledgerHooks = await plugin({ client: makeClient(ledgerCalls) }, { ledger: tmpLedger });
+    await unlink(tmpLedger).catch(() => {});
+    await assert.rejects(
+      () => ledgerHooks["chat.params"](flatChatInput("sess-ledger-api", "deepseek-flash", "deepseek", undefined, OFFICIAL)),
+      /official API/,
+    );
+    const events = await readEvents(tmpLedger);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].endpoint, "api.deepseek.com");
+    assert.equal(events[0].reason, "endpoint");
+  });
+
   it("POSTs a JSON alert on peak start", async () => {
     const nCalls = newCalls();
     const base = scheduled.length;
@@ -314,11 +382,12 @@ describe("opencode plugin (synthetic peak window)", () => {
 
   it("aborts official sessions at peak start, keeps proxies and strangers", async () => {
     // sess-deep: official endpoint, recorded via the block above.
+    // sess-live: flat shape, endpoint via model.api.url, recorded above.
     // sess-proxy: flat-rate proxy, recorded via the pass-through above.
     // sess-claude: unknown endpoint, non-deepseek name.
     // sess-direct: unknown endpoint, deepseek provider name (fallback hit).
     // sess-ghost: never seen (no chat.params) — aborted conservatively.
-    for (const id of ["sess-deep", "sess-proxy", "sess-claude", "sess-direct", "sess-ghost"]) {
+    for (const id of ["sess-deep", "sess-live", "sess-proxy", "sess-claude", "sess-direct", "sess-ghost"]) {
       await hooks.event({
         event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } },
       });
@@ -329,7 +398,7 @@ describe("opencode plugin (synthetic peak window)", () => {
     // The timer callback floats the onTransition() promise (fire-and-forget by
     // design), so flush the microtask queue before asserting on its effects.
     await new Promise((r) => setImmediate(r));
-    assert.deepEqual(calls.aborts, ["sess-deep", "sess-direct", "sess-ghost"]);
+    assert.deepEqual(calls.aborts, ["sess-deep", "sess-live", "sess-direct", "sess-ghost"]);
     assert.ok(calls.toasts.some((t) => /peak hours started/.test(t.message)));
   });
 

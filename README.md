@@ -166,9 +166,12 @@ Restart opencode after changing config or the plugin file (loaded once at startu
 What it does:
 
 - **Endpoint-first matching** — peak pricing applies ONLY to DeepSeek's
-  official API, so the plugin checks where the request actually goes
-  (`provider.options.baseURL`, e.g. `api.deepseek.com` vs a flat-rate
-  proxy like `api.neutralbeats.com`), not just the model name:
+  official API, so the plugin checks where the request actually goes, not
+  just the model name. The endpoint resolves as: explicit
+  `provider.options.baseURL` (custom config override) first, else the
+  model's canonical `api.url` (models.dev default — this is how the
+  built-in `deepseek` provider is detected, since its options carry no
+  `baseURL`):
   - `matchMode: "endpoint"` (default) — guard official-endpoint traffic.
     Known proxies always pass; an unknown endpoint falls back to name
     matching (conservative).
