@@ -2,7 +2,7 @@
 //
 // Blocks requests billed through DeepSeek's official API during peak pricing
 // hours, and aborts already-running official-API sessions the moment peak
-// begins, so you never pay the 2x peak rates by accident. Off-peak requests
+// begins, so you never pay the peak rates (2x off-peak) by accident. Off-peak requests
 // pass through untouched — and so does anything served by a flat-rate proxy
 // or mirror, because peak pricing applies ONLY to api.deepseek.com.
 // Matching is endpoint-first (see lib/match.mjs): an explicit
@@ -191,7 +191,7 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
     const now = new Date();
     if (!isPeak(now, windows)) {
       const t = nextTransition(now, windows);
-      const message = `DeepSeek off-peak started — 0.5x rates until ${formatClockUTC(t.at)}.`;
+      const message = `DeepSeek off-peak started — 0.5x peak rates until ${formatClockUTC(t.at)}.`;
       void appendEvent(ledgerPath, { type: "offpeak-start" });
       if (opts.notifyUrl) {
         void notify(opts.notifyUrl, { service: "deepseek-peak", event: "offpeak-start", message, at: now.toISOString() });
@@ -270,7 +270,7 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
     const message =
       tr.to === "peak"
         ? `DeepSeek peak starts in ${formatDuration(tr.inMs)} (at ${formatClockUTC(tr.at)}) — wrap up DeepSeek work.`
-        : `DeepSeek off-peak starts in ${formatDuration(tr.inMs)} (at ${formatClockUTC(tr.at)}) — 0.5x rates.`;
+        : `DeepSeek off-peak starts in ${formatDuration(tr.inMs)} (at ${formatClockUTC(tr.at)}) — 0.5x peak rates.`;
     await toast(message, "info");
     await log("info", message);
   };
@@ -358,16 +358,16 @@ export const DeepSeekPeak: Plugin = async ({ client }, rawOptions) => {
       const endpoint = hostOf(baseURL) || "unknown";
       if (opts.mode === "warn") {
         await appendEvent(ledgerPath, { type: "allowed-warn", session: input.sessionID, model: label, endpoint, reason: verdict.reason });
-        await toast(`DeepSeek peak hours: ${label} bills at 2x rates until ${formatClockUTC(s.transition.at)}.`, "warning");
+        await toast(`DeepSeek peak hours: ${label} bills at 2x off-peak rates until ${formatClockUTC(s.transition.at)}.`, "warning");
         await log("warn", `Peak-hour request to ${label} allowed (mode=warn), session ${input.sessionID}.`);
         return;
       }
       const message = [
         `DeepSeek peak hours — request blocked by the deepseek-peak plugin.`,
         verdict.reason === "endpoint"
-          ? `Model: ${label} via ${endpoint} (official API). Peak windows (UTC): ${describeWindows(windows)} — standard (2x) rates apply right now.`
-          : `Model: ${label} (endpoint ${endpoint}, matched by name). Peak windows (UTC): ${describeWindows(windows)} — standard (2x) rates apply right now.`,
-        `Off-peak starts at ${formatClockUTC(s.transition.at)} (in ${formatDuration(s.transition.inMs)}), rates drop to 0.5x.`,
+          ? `Model: ${label} via ${endpoint} (official API). Peak windows (UTC): ${describeWindows(windows)} — standard rates (2x off-peak) apply right now.`
+          : `Model: ${label} (endpoint ${endpoint}, matched by name). Peak windows (UTC): ${describeWindows(windows)} — standard rates (2x off-peak) apply right now.`,
+        `Off-peak starts at ${formatClockUTC(s.transition.at)} (in ${formatDuration(s.transition.inMs)}), rates drop to 0.5x peak.`,
         `Options: switch to a non-DeepSeek model, wait for off-peak, or relax the guard with`,
         `the plugin option mode:"warn" or the DEEPSEEK_PEAK_MODE=warn environment variable.`,
       ].join("\n");

@@ -22,7 +22,7 @@ No install needed, just Node >= 22.18:
 node cli.mjs status
 # DeepSeek pricing windows: peak Mon–Fri 01:00–04:00; Mon–Fri 06:00–10:00 UTC; ...
 # Now:    2026-09-14 09:13:21 UTC  (2026-09-14 14:13:21 (UTC+05:00))
-# Status: PEAK — standard (2x) rates
+# Status: PEAK — standard rates (2x off-peak)
 # Peak ends at 10:00 UTC, in 00:46:38
 # Next peak: 2026-09-15 01:00:00 UTC (in 14:59:59)
 ```
@@ -187,7 +187,7 @@ What it does:
   begins it aborts busy sessions that used DeepSeek models (tracked via
   `chat.params` + `session.status` events, double-checked with
   `client.session.status()`), shows a TUI toast, and writes to the opencode
-  log. When off-peak begins it shows a "0.5x rates" toast.
+   log. When off-peak begins it shows a "0.5x peak rates" toast.
 - **Pre-transition warning** — a heads-up toast `warnBeforeMin` minutes
   before each transition (default 10), so you can wrap up in time.
 - **Ledger** — every block, warn-mode pass, abort, and transition is
