@@ -1,10 +1,15 @@
-// Smoke test for the opencode plugin (runs without an opencode server).
+// Smoke test for the opencode server plugin (runs without an opencode server).
 //
 // The plugin reads the real clock, so most tests synthesize a peak window
 // around "now" via DEEPSEEK_PEAK_SCHEDULE before importing the plugin:
 // a 2-hour window starting at the current UTC hour, on today's weekday.
 // That makes the tests deterministic no matter when they run.
 // A dedicated off-peak-schedule section covers the off-peak paths.
+//
+// The plugin is driven through its real V2 surface — Plugin.define, setup(ctx),
+// ctx.session.hook, ctx.event.subscribe, ctx.rpc — with a fake context, so the
+// guard, the abort-on-transition path and every channel (alerts, ledger,
+// webhook) are exercised exactly as OpenCode would call them.
 //
 // Requires Node >= 22.18 (type-stripping for the `.ts` plugin import).
 
@@ -79,93 +84,177 @@ async function waitFor(cond, timeoutMs = 5000) {
   }
 }
 
-function makeClient(calls, busySessions = {}) {
-  return {
-    app: {
-      log: async ({ body }) => {
-        calls.logs.push(body);
-        return true;
+/** Poll an async predicate — used for ledger writes, which land on the I/O queue. */
+async function waitForAsync(fn, timeoutMs = 5000) {
+  const start = Date.now();
+  for (;;) {
+    const value = await fn();
+    if (value) return value;
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting for condition");
+    await new Promise((r) => realSetTimeout(r, 25));
+  }
+}
+
+/** Let queued microtasks and immediates settle. */
+const flush = () => new Promise((r) => setImmediate(r));
+
+/**
+ * A webhook receiver for the notify tests. Connections are closed per response
+ * on purpose: the suite runs longer than the default keep-alive timeout, and a
+ * pooled socket that the server closes mid-suite makes undici's reuse racy.
+ */
+function webhookServer(onBody) {
+  return createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      onBody(body);
+      res.writeHead(200, { "content-type": "text/plain", connection: "close" });
+      res.end("ok");
+    });
+  });
+}
+
+// The catalog the fake server exposes. Mirrors the V2 shapes: providers carry
+// settings.baseURL, models carry a display name and no api.url.
+const PROVIDERS = [
+  { id: "deepseek", name: "DeepSeek", settings: { baseURL: OFFICIAL } },
+  { id: "neutralbeats-chat", name: "NeutralBeats Chat", settings: { baseURL: PROXY } },
+  { id: "my-proxy", name: "My Proxy", settings: {} },
+  { id: "bare", name: "", settings: {} },
+  { id: "deepseek-mirror", name: "DeepSeek Mirror", settings: {} },
+];
+const MODELS = [
+  { id: "deepseek-chat", providerID: "deepseek", name: "DeepSeek Chat" },
+  { id: "deepseek-flash", providerID: "deepseek", name: "DeepSeek Flash" },
+  { id: "deepseek-v4.1-flash", providerID: "neutralbeats-chat", name: "DeepSeek V4.1 Flash" },
+  { id: "claude-haiku", providerID: "neutralbeats-chat", name: "Claude Haiku" },
+  { id: "llama", providerID: "my-proxy", name: "Llama" },
+  { id: "mystery", providerID: "bare", name: "Mystery Model" },
+  { id: "gpt-mirror", providerID: "deepseek-mirror", name: "GPT Mirror" },
+];
+
+/**
+ * A fake V2 plugin context. `hooks` holds the registered session hooks, and
+ * `send` delivers events into the live subscription the plugin opened.
+ */
+function makeCtx({
+  options = {},
+  providers = PROVIDERS,
+  models = MODELS,
+  interrupt,
+  emitFails = false,
+  listFails = false,
+} = {}) {
+  const calls = { alerts: [], interrupts: [], disposals: 0, hooks: [] };
+  const hooks = new Map();
+  let waiting = null;
+
+  const stream = {
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+    next() {
+      return new Promise((resolve, reject) => {
+        waiting = { resolve, reject };
+        if (listFails === "stream") reject(new Error("stream down"));
+      });
+    },
+    return() {
+      return Promise.resolve({ done: true, value: undefined });
+    },
+  };
+
+  const ctx = {
+    options,
+    app: { name: "cli", version: "2.0.16", channel: "latest" },
+    location: { directory: "/tmp/project", project: { id: "p", directory: "/tmp/project", canonical: "/tmp/project" } },
+    rpc: {
+      async register() {
+        return {
+          events: {
+            emit: async (name, data) => {
+              if (emitFails) throw new Error("no client attached");
+              calls.alerts.push({ name, data });
+            },
+          },
+          dispose: async () => {
+            calls.disposals++;
+          },
+        };
       },
     },
-    tui: {
-      showToast: async ({ body }) => {
-        calls.toasts.push(body);
-        return true;
+    model: {
+      list: async () => {
+        if (listFails === "models") throw new Error("catalog down");
+        return { data: models };
+      },
+    },
+    provider: {
+      list: async () => {
+        if (listFails === "providers") throw new Error("catalog down");
+        return { data: providers };
       },
     },
     session: {
-      status: async () => busySessions,
-      abort: async ({ path }) => {
-        calls.aborts.push(path.id);
-        return true;
+      hook: async (name, callback) => {
+        hooks.set(name, callback);
+        calls.hooks.push(name);
+        return { dispose: async () => hooks.delete(name) };
+      },
+      interrupt:
+        interrupt ??
+        (async ({ sessionID }) => {
+          calls.interrupts.push(sessionID);
+          return { interrupted: true };
+        }),
+    },
+    event: {
+      subscribe: ({ signal } = {}) => {
+        signal?.addEventListener("abort", () => {
+          const w = waiting;
+          waiting = null;
+          w?.resolve({ done: true, value: undefined });
+        });
+        return stream;
       },
     },
   };
+
+  /** Deliver one event and let the plugin's consumer loop pick it up. */
+  const send = async (event) => {
+    const w = waiting;
+    if (!w) throw new Error("plugin is not subscribed to the event stream");
+    waiting = null;
+    w.resolve({ value: event, done: false });
+    await flush();
+  };
+
+  /** Fire the registered model.request hook exactly as the server would. */
+  const request = (input) => hooks.get("model.request")(input);
+
+  return { ctx, calls, send, request, hooks };
 }
 
-function newCalls() {
-  return { logs: [], toasts: [], aborts: [] };
-}
-
-function chatInput(sessionID, modelID, providerID, baseURL, apiURL) {
+/** A model.request hook event as OpenCode delivers it. */
+function modelRequest(sessionID, modelID, providerID, baseURL, kind = "primary") {
   return {
     sessionID,
     agent: "build",
-    model: {
-      id: modelID,
-      name: modelID,
-      providerID,
-      ...(apiURL === undefined ? {} : { api: { id: modelID, url: apiURL } }),
-    },
-    provider: {
-      source: "config",
-      info: { id: providerID, name: providerID },
-      options: baseURL === undefined ? {} : { baseURL },
-    },
-    message: {},
+    model: { id: modelID, providerID, variant: "default" },
+    kind,
+    ...(baseURL === undefined ? {} : { baseURL }),
+    headers: {},
   };
 }
 
-/** Live runtime shape: flat Provider.Info (id/name/options top-level), no .info wrapper. */
-function flatChatInput(sessionID, modelID, providerID, baseURL, apiURL) {
-  return {
-    sessionID,
-    agent: "build",
-    model: {
-      id: modelID,
-      name: modelID,
-      providerID,
-      ...(apiURL === undefined ? {} : { api: { id: modelID, url: apiURL } }),
-    },
-    provider: {
-      id: providerID,
-      name: providerID,
-      source: "config",
-      env: [],
-      options: baseURL === undefined ? {} : { baseURL },
-      models: {},
-    },
-    message: {},
-  };
-}
-
-/** Shape observed live: some providers omit `info`/`options` entirely. */
-function bareChatInput(sessionID, modelID, providerID) {
-  return {
-    sessionID,
-    agent: "build",
-    model: { id: modelID, name: modelID, providerID },
-    provider: { source: "config" },
-    message: {},
-  };
-}
+const exec = (type, sessionID) => ({ type, data: { sessionID } });
 
 const tmpLedger = join(tmpdir(), `deepseek-peak-plugin-test-${process.pid}.jsonl`);
 
 describe("opencode plugin (synthetic peak window)", () => {
   let plugin;
-  let hooks;
-  let calls;
+  let harness;
   let notifyServer;
   let notifyUrl;
   let notified = [];
@@ -173,22 +262,14 @@ describe("opencode plugin (synthetic peak window)", () => {
   before(async () => {
     synthesizePeakAroundNow();
     notified = [];
-    notifyServer = createServer((req, res) => {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => {
-        notified.push(body);
-        res.writeHead(200, { "content-type": "text/plain" });
-        res.end("ok");
-      });
-    });
+    notifyServer = webhookServer((body) => notified.push(body));
     await new Promise((resolve) => notifyServer.listen(0, "127.0.0.1", resolve));
     notifyUrl = `http://127.0.0.1:${notifyServer.address().port}/hook`;
-    calls = newCalls();
-    plugin = (await import("../opencode-plugin.ts")).default;
+    plugin = (await import("../index.ts")).default;
     // ledger:false — the default ledger path is the real user data dir,
     // which tests must never touch.
-    hooks = await plugin({ client: makeClient(calls) }, { mode: "block", ledger: false });
+    harness = makeCtx({ options: { mode: "block", ledger: false } });
+    await plugin.setup(harness.ctx);
   });
 
   after(async () => {
@@ -200,384 +281,365 @@ describe("opencode plugin (synthetic peak window)", () => {
     await unlink(tmpLedger).catch(() => {});
   });
 
-  it("logs an activation message on init", () => {
-    assert.ok(calls.logs.some((l) => l.service === "deepseek-peak" && /active/.test(l.message)));
-    assert.ok(calls.logs.some((l) => /match=endpoint/.test(l.message)));
+  it("registers the model.request guard and publishes the activation notice", async () => {
+    assert.ok(harness.calls.hooks.includes("model.request"));
+    const withLedger = makeCtx({ options: { ledger: tmpLedger } });
+    await plugin.setup(withLedger.ctx);
+    const events = await readEvents(tmpLedger);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "notice");
+    assert.match(events[0].notice, /deepseek-peak active/);
+    assert.match(events[0].notice, /match=endpoint/);
+    await unlink(tmpLedger).catch(() => {});
   });
 
   it("blocks official-endpoint DeepSeek during peak", async () => {
     await assert.rejects(
-      () => hooks["chat.params"](chatInput("sess-deep", "deepseek-chat", "deepseek", OFFICIAL)),
+      () => harness.request(modelRequest("sess-deep", "deepseek-chat", "deepseek", OFFICIAL)),
       /official API/,
     );
   });
 
-  it("blocks the built-in deepseek provider via model.api.url (no options.baseURL)", async () => {
-    // Live shape: flat Provider.Info with empty options; the endpoint comes
-    // from model.api.url (https://api.deepseek.com in models.dev).
+  it("blocks when the endpoint comes from the provider catalog", async () => {
+    // No baseURL on the hook event: the catalog entry supplies the endpoint.
     await assert.rejects(
-      () => hooks["chat.params"](flatChatInput("sess-live", "deepseek-flash", "deepseek", undefined, OFFICIAL)),
+      () => harness.request(modelRequest("sess-catalog", "deepseek-flash", "deepseek", undefined)),
       /official API/,
     );
-    // A custom proxy baseURL still wins over an official-looking api.url.
-    await hooks["chat.params"](flatChatInput("sess-live-proxy", "deepseek-flash", "deepseek", PROXY, OFFICIAL));
   });
 
-  it("reads the provider name from the flat Provider.Info shape", async () => {
-    const input = flatChatInput("sess-flatname", "some-model", "my-proxy", undefined, undefined);
-    input.provider.name = "DeepSeek mirror";
-    await assert.rejects(() => hooks["chat.params"](input), /matched by name/);
+  it("reads provider and model display names from the catalog", async () => {
+    // "mystery"/"bare" is neither DeepSeek nor on a known proxy, but the
+    // provider is named "My DeepSeek Mirror" once the catalog is refreshed.
+    const h = makeCtx({
+      options: { ledger: false },
+      providers: [{ id: "bare", name: "My DeepSeek Mirror", settings: {} }],
+    });
+    await plugin.setup(h.ctx);
+    await assert.rejects(
+      () => h.request(modelRequest("sess-flatname", "mystery", "bare", undefined)),
+      /matched by name/,
+    );
   });
 
   it("passes DeepSeek models on a flat-rate proxy", async () => {
-    await hooks["chat.params"](chatInput("sess-proxy", "deepseek-v4.1-flash", "neutralbeats-chat", PROXY));
+    await harness.request(modelRequest("sess-proxy", "deepseek-v4.1-flash", "neutralbeats-chat", PROXY));
+    await harness.request(modelRequest("sess-proxy2", "deepseek-v4.1-flash", "neutralbeats-chat"));
   });
 
   it("name fallback blocks when the endpoint is unknown", async () => {
+    // No baseURL on the hook event and none in the catalog: the provider id
+    // and name carry the DeepSeek signal, so the name rule decides.
     await assert.rejects(
-      () => hooks["chat.params"](chatInput("sess-direct", "some-model", "deepseek")),
+      () => harness.request(modelRequest("sess-direct", "gpt-mirror", "deepseek-mirror", undefined)),
       /matched by name/,
     );
   });
 
   it("name fallback passes unknown non-deepseek traffic", async () => {
-    await hooks["chat.params"](chatInput("sess-claude", "claude-opus-4-7", "neutralbeats-chat"));
-  });
-
-  it("passes when nothing matches and the endpoint is unknown", async () => {
-    await hooks["chat.params"](chatInput("sess-empty", "", "x"));
+    const h = makeCtx({ options: { ledger: false } });
+    await plugin.setup(h.ctx);
+    await h.request(modelRequest("sess-claude", "claude-haiku", "neutralbeats-chat", undefined));
+    await h.request(modelRequest("sess-empty", "", "x", undefined));
   });
 
   it("blocks with an empty provider id (label fallback)", async () => {
-    await assert.rejects(() => hooks["chat.params"](chatInput("sess-noprov", "deepseek-chat", "")), /\?\/deepseek-chat/);
+    await assert.rejects(
+      () => harness.request(modelRequest("sess-noprov", "deepseek-chat", "", OFFICIAL)),
+      /\?\/deepseek-chat/,
+    );
   });
 
   it("blocks with an empty model id (label fallback)", async () => {
-    await assert.rejects(() => hooks["chat.params"](chatInput("sess-nomodel", "", "deepseek")), /deepseek\/\?/);
-  });
-
-  it("explicit endpoint mode matches the default", async () => {
-    const c = newCalls();
-    await plugin({ client: makeClient(c) }, { ledger: false, matchMode: "endpoint" });
-    assert.ok(c.logs.some((l) => /match=endpoint/.test(l.message)));
-  });
-
-  it("empty notifyUrl option disables notifications", async () => {
-    const c = newCalls();
-    await plugin({ client: makeClient(c) }, { ledger: false, notifyUrl: "" });
-    assert.ok(c.logs.some((l) => /notify=off/.test(l.message)));
-  });
-
-  it("notifyUrl comes from the environment too", async () => {
-    await withEnv({ DEEPSEEK_PEAK_NOTIFY_URL: notifyUrl }, async () => {
-      const c = newCalls();
-      const base = scheduled.length;
-      const h = await plugin({ client: makeClient(c, { "sess-env": { type: "busy" } }) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /notify=on/.test(l.message)));
-      await assert.rejects(
-        () => h["chat.params"](chatInput("sess-env", "deepseek-chat", "deepseek", OFFICIAL)),
-        /peak hours/,
-      );
-      await h.event({
-        event: { type: "session.status", properties: { sessionID: "sess-env", status: { type: "busy" } } },
-      });
-      const seen = notified.length;
-      await scheduled[base].fn();
-      await waitFor(() => notified.length > seen);
-      assert.deepEqual(c.aborts, ["sess-env"]);
-    });
-  });
-
-  it("survives providers that omit info/options (observed live)", async () => {
-    // No endpoint info → name fallback blocks deepseek names...
-    await assert.rejects(() => hooks["chat.params"](bareChatInput("sess-bare", "deepseek-chat", "deepseek")), /matched by name/);
-    // ...and passes everything else.
-    await hooks["chat.params"](bareChatInput("sess-bare2", "some-model", "somewhere"));
-  });
-
-  it("survives model without api.url (observed live)", async () => {
-    // Flat provider, no options.baseURL, model without api — name fallback.
     await assert.rejects(
-      () => hooks["chat.params"](flatChatInput("sess-noapi", "deepseek-chat", "deepseek")),
-      /matched by name/,
+      () => harness.request(modelRequest("sess-nomodel", "", "deepseek")),
+      /deepseek\/\?/,
     );
-    await hooks["chat.params"](flatChatInput("sess-noapi2", "some-model", "somewhere"));
   });
 
-  it("survives info without a name", async () => {
-    const input = chatInput("sess-noname", "deepseek-chat", "deepseek", OFFICIAL);
-    input.provider.info = {};
-    await assert.rejects(() => hooks["chat.params"](input), /official API/);
+  it("names the request kind for non-primary calls", async () => {
+    await assert.rejects(
+      () => harness.request(modelRequest("sess-title", "deepseek-chat", "deepseek", OFFICIAL, "title")),
+      /title request blocked/,
+    );
+    await assert.rejects(
+      () => harness.request(modelRequest("sess-compact", "deepseek-chat", "deepseek", OFFICIAL, "compaction")),
+      /compaction request blocked/,
+    );
   });
 
-  it("warn mode lets requests through with a toast", async () => {
-    const warnCalls = newCalls();
-    const warnHooks = await plugin({ client: makeClient(warnCalls) }, { mode: "warn", ledger: false });
-    await warnHooks["chat.params"](chatInput("sess-warn", "deepseek-chat", "deepseek", OFFICIAL));
-    assert.equal(warnCalls.toasts.length, 1);
-    assert.match(warnCalls.toasts[0].message, /peak hours/);
+  it("publishes an alert for every block", async () => {
+    const h = makeCtx({ options: { ledger: false } });
+    await plugin.setup(h.ctx);
+    await assert.rejects(
+      () => h.request(modelRequest("sess-alert", "deepseek-chat", "deepseek", OFFICIAL)),
+      /peak hours/,
+    );
+    assert.equal(h.calls.alerts.length, 1);
+    assert.equal(h.calls.alerts[0].name, "alert");
+    assert.equal(h.calls.alerts[0].data.kind, "blocked");
+    assert.equal(h.calls.alerts[0].data.variant, "error");
+    assert.match(h.calls.alerts[0].data.title, /DeepSeek peak hours/);
+  });
+
+  it("warn mode lets requests through with a warning alert", async () => {
+    const h = makeCtx({ options: { mode: "warn", ledger: false } });
+    await plugin.setup(h.ctx);
+    await h.request(modelRequest("sess-warn", "deepseek-chat", "deepseek", OFFICIAL));
+    assert.equal(h.calls.alerts.length, 1);
+    assert.equal(h.calls.alerts[0].data.kind, "allowed-warn");
+    assert.equal(h.calls.alerts[0].data.variant, "warning");
+    assert.match(h.calls.alerts[0].data.message, /2x off-peak rates/);
+  });
+
+  it("survives a failing alert channel", async () => {
+    const h = makeCtx({ options: { ledger: false }, emitFails: true });
+    await plugin.setup(h.ctx);
+    await assert.rejects(
+      () => h.request(modelRequest("sess-nochan", "deepseek-chat", "deepseek", OFFICIAL)),
+      /peak hours/,
+    );
+  });
+
+  it("writes blocked requests to the ledger", async () => {
+    const h = makeCtx({ options: { ledger: tmpLedger } });
+    await plugin.setup(h.ctx);
+    await unlink(tmpLedger).catch(() => {});
+    await assert.rejects(
+      () => h.request(modelRequest("sess-ledger", "deepseek-chat", "deepseek", OFFICIAL)),
+      /peak hours/,
+    );
+    // The hook awaits ledger writes, so the event is on disk already.
+    const events = await readEvents(tmpLedger);
+    const blocked = events.filter((e) => e.type === "blocked");
+    assert.equal(blocked.length, 1);
+    assert.equal(blocked[0].session, "sess-ledger");
+    assert.equal(blocked[0].endpoint, "api.deepseek.com");
+    assert.equal(blocked[0].reason, "endpoint");
+    await unlink(tmpLedger).catch(() => {});
   });
 
   it("warns shortly before the transition", async () => {
     // scheduled: [transition, warn] per plugin instance; [0] and [1] are ours.
     const warnTimer = scheduled[1];
     assert.ok(warnTimer && warnTimer.ms > 1000, "expected an armed transition timer");
-    const before = calls.toasts.length;
+    const before = harness.calls.alerts.length;
     await warnTimer.fn();
-    await new Promise((r) => setImmediate(r));
-    assert.equal(calls.toasts.length, before + 1);
-    assert.match(calls.toasts.at(-1).message, /starts in/);
+    await flush();
+    assert.equal(harness.calls.alerts.length, before + 1);
+    assert.equal(harness.calls.alerts.at(-1).data.kind, "warn");
+    assert.match(harness.calls.alerts.at(-1).data.message, /starts in/);
   });
 
-  it("writes blocked requests to the ledger", async () => {
-    const ledgerCalls = newCalls();
-    const ledgerHooks = await plugin({ client: makeClient(ledgerCalls) }, { ledger: tmpLedger });
-    await assert.rejects(
-      () => ledgerHooks["chat.params"](chatInput("sess-ledger", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    // chat.params awaits ledger writes, so the event is on disk already.
-    const events = await readEvents(tmpLedger);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].type, "blocked");
-    assert.equal(events[0].session, "sess-ledger");
-    assert.equal(events[0].endpoint, "api.deepseek.com");
-    assert.equal(events[0].reason, "endpoint");
-  });
-
-  it("writes api.url-resolved blocks to the ledger with the official host", async () => {
-    const ledgerCalls = newCalls();
-    const ledgerHooks = await plugin({ client: makeClient(ledgerCalls) }, { ledger: tmpLedger });
-    await unlink(tmpLedger).catch(() => {});
-    await assert.rejects(
-      () => ledgerHooks["chat.params"](flatChatInput("sess-ledger-api", "deepseek-flash", "deepseek", undefined, OFFICIAL)),
-      /official API/,
-    );
-    const events = await readEvents(tmpLedger);
-    assert.equal(events.length, 1);
-    assert.equal(events[0].endpoint, "api.deepseek.com");
-    assert.equal(events[0].reason, "endpoint");
-  });
-
-  it("POSTs a JSON alert on peak start", async () => {
-    const nCalls = newCalls();
-    const base = scheduled.length;
-    const nHooks = await plugin({ client: makeClient(nCalls, { "sess-notify": { type: "busy" } }) }, { ledger: false, notifyUrl });
-    await assert.rejects(
-      () => nHooks["chat.params"](chatInput("sess-notify", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await nHooks.event({
-      event: { type: "session.status", properties: { sessionID: "sess-notify", status: { type: "busy" } } },
+  it("POSTs a JSON alert on peak start and interrupts official sessions", async () => {
+    const h = makeCtx({
+      options: { ledger: false, notifyUrl },
+      interrupt: async ({ sessionID }) => {
+        h.calls.interrupts.push(sessionID);
+        return { interrupted: true };
+      },
     });
-    await scheduled[base].fn(); // this instance's transition timer
+    const base = scheduled.length;
+    await plugin.setup(h.ctx);
+    await assert.rejects(
+      () => h.request(modelRequest("sess-notify", "deepseek-chat", "deepseek", OFFICIAL)),
+      /peak hours/,
+    );
+    await h.send(exec("session.execution.started", "sess-notify"));
+    await scheduled[base].fn();
+    await flush();
     // notify() is fire-and-forget by design — poll for the HTTP round-trip.
     await waitFor(() => notified.length > 0);
-    assert.deepEqual(nCalls.aborts, ["sess-notify"]);
+    assert.deepEqual(h.calls.interrupts, ["sess-notify"]);
     const body = JSON.parse(notified.at(-1));
     assert.equal(body.service, "deepseek-peak");
     assert.equal(body.event, "peak-start");
     assert.match(body.message, /peak hours started/);
+    assert.equal(h.calls.alerts.at(-1).data.kind, "peak-start");
   });
 
-  it("aborts official sessions at peak start, keeps proxies and strangers", async () => {
-    // sess-deep: official endpoint, recorded via the block above.
-    // sess-live: flat shape, endpoint via model.api.url, recorded above.
-    // sess-proxy: flat-rate proxy, recorded via the pass-through above.
-    // sess-claude: unknown endpoint, non-deepseek name.
-    // sess-direct: unknown endpoint, deepseek provider name (fallback hit).
-    // sess-ghost: never seen (no chat.params) — aborted conservatively.
-    for (const id of ["sess-deep", "sess-live", "sess-proxy", "sess-claude", "sess-direct", "sess-ghost"]) {
-      await hooks.event({
-        event: { type: "session.status", properties: { sessionID: id, status: { type: "busy" } } },
-      });
+  it("interrupts official sessions at peak start, keeps proxies and strangers", async () => {
+    // sess-deep: official endpoint, recorded by the block above.
+    // sess-proxy: flat-rate proxy, recorded by the pass-through above.
+    // sess-ghost: never seen (no model.request) — interrupted conservatively.
+    for (const id of ["sess-deep", "sess-proxy", "sess-ghost"]) {
+      await harness.send(exec("session.execution.started", id));
     }
     const armedAtInit = scheduled[0];
     assert.ok(armedAtInit && armedAtInit.ms > 0, "expected an armed transition timer");
     await armedAtInit.fn();
-    // The timer callback floats the onTransition() promise (fire-and-forget by
-    // design), so flush the microtask queue before asserting on its effects.
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(calls.aborts, ["sess-deep", "sess-live", "sess-direct", "sess-ghost"]);
-    assert.ok(calls.toasts.some((t) => /peak hours started/.test(t.message)));
+    await flush();
+    assert.deepEqual(harness.calls.interrupts, ["sess-deep", "sess-ghost"]);
+    assert.ok(harness.calls.alerts.some((a) => /peak hours started/.test(a.data.message)));
   });
 
-  it("abortAllOnPeak also aborts proxy sessions", async () => {
-    const c = newCalls();
+  it("abortAllOnPeak also interrupts proxy sessions", async () => {
+    const h = makeCtx({ options: { ledger: false, abortAllOnPeak: true } });
     const base = scheduled.length;
-    const h = await plugin({ client: makeClient(c) }, { ledger: false, abortAllOnPeak: true });
-    await h["chat.params"](chatInput("sess-p", "deepseek-chat", "neutralbeats-chat", PROXY));
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-p", status: { type: "busy" } } },
-    });
+    await plugin.setup(h.ctx);
+    await h.request(modelRequest("sess-p", "deepseek-chat", "neutralbeats-chat", PROXY));
+    await h.send(exec("session.execution.started", "sess-p"));
     await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, ["sess-p"]);
+    await flush();
+    assert.deepEqual(h.calls.interrupts, ["sess-p"]);
   });
 
-  it("abortOnPeak:false aborts nothing", async () => {
-    const c = newCalls();
+  it("abortOnPeak:false interrupts nothing", async () => {
+    const h = makeCtx({ options: { ledger: false, abortOnPeak: false } });
     const base = scheduled.length;
-    const h = await plugin({ client: makeClient(c) }, { ledger: false, abortOnPeak: false });
+    await plugin.setup(h.ctx);
     await assert.rejects(
-      () => h["chat.params"](chatInput("sess-a", "deepseek-chat", "deepseek", OFFICIAL)),
+      () => h.request(modelRequest("sess-a", "deepseek-chat", "deepseek", OFFICIAL)),
       /peak hours/,
     );
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-a", status: { type: "busy" } } },
-    });
+    await h.send(exec("session.execution.started", "sess-a"));
     await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, []);
-    assert.ok(c.toasts.some((t) => /abort is disabled/.test(t.message)));
+    await flush();
+    assert.deepEqual(h.calls.interrupts, []);
+    assert.ok(h.calls.alerts.some((a) => /abort is disabled/.test(a.data.message)));
   });
 
-  it("counts unabortable sessions as skipped", async () => {
-    const c = newCalls();
-    const refusing = makeClient(c);
-    refusing.session.abort = async () => false;
-    const base = scheduled.length;
-    const h = await plugin({ client: refusing }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-r", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-r", status: { type: "busy" } } },
-    });
-    await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, []);
-  });
-
-  it("survives a throwing abort", async () => {
-    const c = newCalls();
-    const throwing = makeClient(c);
-    throwing.session.abort = async () => {
-      throw new Error("gone");
-    };
-    const base = scheduled.length;
-    const h = await plugin({ client: throwing }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-t", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-t", status: { type: "busy" } } },
-    });
-    await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, []);
-  });
-
-  it("tolerates odd session.status payloads", async () => {
-    for (const payload of [null, 42]) {
-      const c = newCalls();
-      const broken = makeClient(c, payload);
+  it("counts sessions that could not be interrupted as skipped", async () => {
+    for (const [label, impl] of [
+      ["already finished", async () => ({ interrupted: false })],
+      ["no verdict at all", async () => undefined],
+      ["server error", async () => {
+        throw new Error("gone");
+      }],
+    ]) {
+      const h = makeCtx({
+        options: { ledger: false },
+        interrupt: async ({ sessionID }) => {
+          h.calls.interrupts.push(sessionID);
+          return impl();
+        },
+      });
       const base = scheduled.length;
-      const h = await plugin({ client: broken }, { ledger: false });
-      const sid = `sess-odd-${String(payload)}`;
+      await plugin.setup(h.ctx);
       await assert.rejects(
-        () => h["chat.params"](chatInput(sid, "deepseek-chat", "deepseek", OFFICIAL)),
+        () => h.request(modelRequest("sess-r", "deepseek-chat", "deepseek", OFFICIAL)),
         /peak hours/,
       );
-      await h.event({
-        event: { type: "session.status", properties: { sessionID: sid, status: { type: "busy" } } },
-      });
+      await h.send(exec("session.execution.started", "sess-r"));
       await scheduled[base].fn();
-      await new Promise((r) => setImmediate(r));
-      assert.deepEqual(c.aborts, [sid]);
+      await flush();
+      assert.deepEqual(h.calls.interrupts, ["sess-r"], label);
+      assert.ok(
+        h.calls.alerts.some((a) => new RegExp(`left 1 other session`).test(a.data.message)),
+        `${label}: skipped sessions must be reported`,
+      );
     }
   });
 
-  it("skips null entries in the status map", async () => {
-    const c = newCalls();
+  it("writes interrupted sessions to the ledger", async () => {
+    const h = makeCtx({ options: { ledger: tmpLedger } });
     const base = scheduled.length;
-    const h = await plugin({ client: makeClient(c, { "sess-null": null, "sess-ok": { type: "busy" } }) }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-ok", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-ok", status: { type: "busy" } } },
-    });
+    await plugin.setup(h.ctx);
+    await unlink(tmpLedger).catch(() => {});
+    await h.request(modelRequest("sess-ledger-abort", "deepseek-chat", "deepseek", OFFICIAL)).catch(() => {});
+    await h.send(exec("session.execution.started", "sess-ledger-abort"));
     await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, ["sess-ok"]);
+    const aborted = await waitForAsync(async () => {
+      const found = (await readEvents(tmpLedger)).filter((e) => e.type === "aborted");
+      return found.length ? found : undefined;
+    });
+    assert.equal(aborted.length, 1);
+    assert.equal(aborted[0].session, "sess-ledger-abort");
+    assert.equal(aborted[0].model, "deepseek/deepseek-chat");
+    assert.equal(aborted[0].endpoint, "api.deepseek.com");
+    const peak = (await readEvents(tmpLedger)).filter((e) => e.type === "peak-start");
+    assert.equal(peak.length, 1);
+    assert.equal(peak[0].aborted, 1);
+    await unlink(tmpLedger).catch(() => {});
   });
 
-  it("falls back to event-tracked sessions when status() throws", async () => {
-    const c = newCalls();
-    const broken = makeClient(c);
-    broken.session.status = async () => {
-      throw new Error("down");
-    };
+  it("records the endpoint as unknown when a guarded session has none", async () => {
+    // Guarded by name, so it is interrupted, but nothing knows its endpoint.
+    const h = makeCtx({ options: { ledger: tmpLedger } });
     const base = scheduled.length;
-    const h = await plugin({ client: broken }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-b", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-b", status: { type: "busy" } } },
-    });
+    await plugin.setup(h.ctx);
+    await unlink(tmpLedger).catch(() => {});
+    await h.request(modelRequest("sess-noep", "gpt-mirror", "deepseek-mirror", undefined)).catch(() => {});
+    await h.send(exec("session.execution.started", "sess-noep"));
     await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(c.aborts, ["sess-b"]);
+    const aborted = await waitForAsync(async () => {
+      const found = (await readEvents(tmpLedger)).filter((e) => e.type === "aborted");
+      return found.length ? found : undefined;
+    });
+    assert.equal(aborted[0].model, "deepseek-mirror/gpt-mirror");
+    assert.equal(aborted[0].endpoint, "unknown");
+    await unlink(tmpLedger).catch(() => {});
   });
 
-  it("survives throwing log and toast sinks", async () => {
-    const c = newCalls();
-    const noisy = makeClient(c);
-    noisy.app.log = async () => {
-      throw new Error("no log");
-    };
-    noisy.tui.showToast = async () => {
-      throw new Error("no tui");
-    };
-    const h = await plugin({ client: noisy }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-n", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
+  it("records aborted sessions with an unknown model when the session was never seen", async () => {
+    const h = makeCtx({ options: { ledger: tmpLedger } });
+    const base = scheduled.length;
+    await plugin.setup(h.ctx);
+    await unlink(tmpLedger).catch(() => {});
+    await h.send(exec("session.execution.started", "sess-unknown"));
+    await scheduled[base].fn();
+    const aborted = await waitForAsync(async () => {
+      const found = (await readEvents(tmpLedger)).filter((e) => e.type === "aborted");
+      return found.length ? found : undefined;
+    });
+    assert.equal(aborted[0].model, "unknown");
+    assert.equal(aborted[0].endpoint, "unknown");
+    await unlink(tmpLedger).catch(() => {});
   });
 
-  it("forgets deleted sessions, clears idle ones, ignores the rest", async () => {
-    const c = newCalls();
+  it("tracks liveness from the execution event stream", async () => {
+    const h = makeCtx({ options: { ledger: false } });
     const base = scheduled.length;
-    const h = await plugin({ client: makeClient(c) }, { ledger: false });
-    await assert.rejects(
-      () => h["chat.params"](chatInput("sess-del", "deepseek-chat", "deepseek", OFFICIAL)),
-      /peak hours/,
-    );
-    await h.event({ event: { type: "session.deleted", properties: { sessionID: "sess-del" } } });
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-del", status: { type: "busy" } } },
-    });
-    await h["chat.params"](chatInput("sess-idle", "deepseek-chat", "deepseek", OFFICIAL)).catch(() => {});
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-idle", status: { type: "busy" } } },
-    });
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-idle", status: { type: "idle" } } },
-    });
-    await h.event({
-      event: { type: "session.status", properties: { sessionID: "sess-nostatus" } },
-    });
-    await h.event({ event: { type: "session.created", properties: { sessionID: "sess-new" } } });
-    await h.event({ event: { type: "file.edited", properties: {} } });
+    await plugin.setup(h.ctx);
+    const sid = "sess-life";
+    await h.request(modelRequest(sid, "deepseek-chat", "deepseek", OFFICIAL)).catch(() => {});
+    // Non-busy events must not enqueue the session.
+    await h.send(exec("session.created", sid));
+    await h.send(exec("session.idle", sid));
+    await h.send(exec("session.execution.succeeded", sid));
+    await h.send(exec("session.execution.failed", sid));
+    await h.send(exec("session.execution.interrupted", sid));
+    // Deleting forgets the recorded endpoint, so the next pass treats it as
+    // unknown and interrupts it conservatively.
+    await h.send(exec("session.deleted", sid));
+    await h.send(exec("session.execution.started", sid));
     await scheduled[base].fn();
-    await new Promise((r) => setImmediate(r));
-    // sess-del was forgotten → aborted as unknown; the idle ones are gone.
-    assert.deepEqual(c.aborts, ["sess-del"]);
+    await flush();
+    assert.deepEqual(h.calls.interrupts, [sid]);
+  });
+
+  it("keeps the catalog fresh when the server reports a change", async () => {
+    const providers = [{ id: "bare", name: "", settings: {} }];
+    const h = makeCtx({ options: { ledger: false }, providers, models: [] });
+    await plugin.setup(h.ctx);
+    // First pass: the name is not DeepSeek yet, so the request passes.
+    await h.request(modelRequest("sess-cat", "mystery", "bare", undefined));
+    // The catalog changes and the server says so.
+    providers[0].name = "DeepSeek Mirror";
+    await h.send({ type: "model.updated", data: {} });
+    await assert.rejects(
+      () => h.request(modelRequest("sess-cat", "mystery", "bare", undefined)),
+      /matched by name/,
+    );
+    // provider.updated invalidates the same cache.
+    providers[0].name = "";
+    await h.send({ type: "provider.updated", data: {} });
+    await h.request(modelRequest("sess-cat", "mystery", "bare", undefined));
+  });
+
+  it("ignores events it does not act on and survives a broken stream", async () => {
+    const h = makeCtx({ options: { ledger: false }, listFails: "stream" });
+    await plugin.setup(h.ctx);
+    // setup must not hang on an immediately failing subscription.
+    await h.request(modelRequest("sess-broken", "deepseek-chat", "deepseek", OFFICIAL)).catch(() => {});
   });
 
   it("matchMode name/both also guard the proxy", async () => {
     for (const matchMode of ["name", "both"]) {
-      const c = newCalls();
-      const h = await plugin({ client: makeClient(c) }, { ledger: false, matchMode });
+      const h = makeCtx({ options: { ledger: false, matchMode } });
+      await plugin.setup(h.ctx);
       await assert.rejects(
-        () => h["chat.params"](chatInput(`sess-${matchMode}`, "deepseek-chat", "neutralbeats-chat", PROXY)),
+        () => h.request(modelRequest(`sess-${matchMode}`, "deepseek-chat", "neutralbeats-chat", PROXY)),
         /peak hours/,
         `mode ${matchMode} should block the proxy`,
       );
@@ -585,98 +647,162 @@ describe("opencode plugin (synthetic peak window)", () => {
   });
 
   it("invalid matchMode falls back to endpoint", async () => {
-    const c = newCalls();
-    const h = await plugin({ client: makeClient(c) }, { ledger: false, matchMode: "bogus" });
-    await h["chat.params"](chatInput("sess-inv", "deepseek-chat", "neutralbeats-chat", PROXY));
+    const h = makeCtx({ options: { ledger: false, matchMode: "bogus" } });
+    await plugin.setup(h.ctx);
+    await h.request(modelRequest("sess-inv", "deepseek-chat", "neutralbeats-chat", PROXY));
   });
 
-  it("matchMode comes from the environment too", async () => {
-    await withEnv({ DEEPSEEK_PEAK_MATCH: "both" }, async () => {
-      const c = newCalls();
-      const h = await plugin({ client: makeClient(c) }, { ledger: false });
+  it("matchMode and notifyUrl come from the environment too", async () => {
+    await withEnv({ DEEPSEEK_PEAK_MATCH: "both", DEEPSEEK_PEAK_NOTIFY_URL: notifyUrl }, async () => {
+      const h = makeCtx({ options: { ledger: false } });
+      const base = scheduled.length;
+      await plugin.setup(h.ctx);
+      // DEEPSEEK_PEAK_MATCH=both must guard the proxy like the config option.
       await assert.rejects(
-        () => h["chat.params"](chatInput("sess-env", "deepseek-chat", "neutralbeats-chat", PROXY)),
+        () => h.request(modelRequest("sess-env", "deepseek-chat", "neutralbeats-chat", PROXY)),
         /peak hours/,
       );
+      await h.send(exec("session.execution.started", "sess-env"));
+      await scheduled[base].fn();
+      await flush();
+      assert.deepEqual(h.calls.interrupts, ["sess-env"], "transition must interrupt the guarded session");
+      assert.ok(
+        h.calls.alerts.some((a) => a.data.kind === "peak-start"),
+        "transition must publish a peak-start alert",
+      );
+      await waitFor(() => notified.length > 1);
     });
     await withEnv({ DEEPSEEK_PEAK_MATCH: "bogus" }, async () => {
-      const c = newCalls();
-      const h = await plugin({ client: makeClient(c) }, { ledger: false });
-      await h["chat.params"](chatInput("sess-env2", "deepseek-chat", "neutralbeats-chat", PROXY));
+      const h = makeCtx({ options: { ledger: false } });
+      await plugin.setup(h.ctx);
+      await h.request(modelRequest("sess-env2", "deepseek-chat", "neutralbeats-chat", PROXY));
     });
+  });
+
+  it("empty notifyUrl disables notifications", async () => {
+    const h = makeCtx({ options: { ledger: tmpLedger, notifyUrl: "" } });
+    await unlink(tmpLedger).catch(() => {});
+    await plugin.setup(h.ctx);
+    const events = await readEvents(tmpLedger);
+    assert.match(events[0].notice, /notify=off/);
+    await unlink(tmpLedger).catch(() => {});
   });
 
   it("boolean-ish env strings are parsed", async () => {
-    await withEnv({ DEEPSEEK_PEAK_ABORT: "0", DEEPSEEK_PEAK_TOAST: "yes" }, async () => {
-      const c = newCalls();
-      await plugin({ client: makeClient(c) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /abortOnPeak=false/.test(l.message)));
+    await withEnv({ DEEPSEEK_PEAK_ABORT: "0", DEEPSEEK_PEAK_WARN_BEFORE: "0" }, async () => {
+      const h = makeCtx({ options: { ledger: tmpLedger } });
+      const base = scheduled.length;
+      await unlink(tmpLedger).catch(() => {});
+      await plugin.setup(h.ctx);
+      const events = await readEvents(tmpLedger);
+      assert.match(events[0].notice, /abortOnPeak=false/);
+      assert.equal(scheduled.length, base + 1, "warnBeforeMin=0 must arm the transition timer only");
+      await unlink(tmpLedger).catch(() => {});
     });
     await withEnv({ DEEPSEEK_PEAK_ABORT: "maybe", DEEPSEEK_PEAK_WARN_BEFORE: "soon" }, async () => {
-      const c = newCalls();
-      await plugin({ client: makeClient(c) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /abortOnPeak=true/.test(l.message) && /warnBeforeMin=10/.test(l.message)));
+      const h = makeCtx({ options: { ledger: tmpLedger } });
+      await unlink(tmpLedger).catch(() => {});
+      await plugin.setup(h.ctx);
+      const events = await readEvents(tmpLedger);
+      assert.match(events[0].notice, /abortOnPeak=true/);
+      assert.match(events[0].notice, /warnBeforeMin=10/);
+      await unlink(tmpLedger).catch(() => {});
     });
   });
 
   it("warn timer can be disabled or pushed out of range", async () => {
     for (const warnBeforeMin of [0, -5, 1000000]) {
       const base = scheduled.length;
-      await plugin({ client: makeClient(newCalls()) }, { ledger: false, warnBeforeMin });
+      const h = makeCtx({ options: { ledger: false, warnBeforeMin } });
+      await plugin.setup(h.ctx);
       assert.equal(scheduled.length, base + 1, `warnBeforeMin=${warnBeforeMin} must arm transition only`);
     }
     const base = scheduled.length;
-    await plugin({ client: makeClient(newCalls()) }, { ledger: false, warnBeforeMin: "3" });
+    await plugin.setup(makeCtx({ options: { ledger: false, warnBeforeMin: "3" } }).ctx);
     assert.equal(scheduled.length, base + 2, "string warnBeforeMin must arm both timers");
     const b3 = scheduled.length;
-    await plugin({ client: makeClient(newCalls()) }, { ledger: false, warnBeforeMin: NaN });
+    await plugin.setup(makeCtx({ options: { ledger: false, warnBeforeMin: NaN } }).ctx);
     assert.equal(scheduled.length, b3 + 2, "NaN warnBeforeMin falls back to default");
-    await withEnv({ DEEPSEEK_PEAK_WARN_BEFORE: "0" }, async () => {
-      const b2 = scheduled.length;
-      await plugin({ client: makeClient(newCalls()) }, { ledger: false });
-      assert.equal(scheduled.length, b2 + 1, "env warnBeforeMin=0 must arm transition only");
-    });
   });
 
-  it("silent mode still blocks", async () => {
-    const c = newCalls();
-    const h = await plugin({ client: makeClient(c) }, { ledger: false, toast: false, log: false });
+  it("log:false silences the ledger without weakening the guard", async () => {
+    // `toast` is a presentation switch honoured by the TUI half, so the server
+    // keeps publishing alerts; `log:false` stops the plugin writing diagnostics.
+    const h = makeCtx({ options: { ledger: tmpLedger, toast: false, log: false } });
+    await unlink(tmpLedger).catch(() => {});
+    await plugin.setup(h.ctx);
     await assert.rejects(
-      () => h["chat.params"](chatInput("sess-s", "deepseek-chat", "deepseek", OFFICIAL)),
+      () => h.request(modelRequest("sess-s", "deepseek-chat", "deepseek", OFFICIAL)),
       /peak hours/,
     );
-    assert.deepEqual([c.logs.length, c.toasts.length], [0, 0]);
+    assert.equal(h.calls.alerts.length, 1, "alerts are published regardless of the toast switch");
+    const events = await readEvents(tmpLedger);
+    assert.deepEqual(
+      events.filter((e) => e.type === "notice"),
+      [],
+      "log:false must not write diagnostics",
+    );
+    assert.equal(
+      events.filter((e) => e.type === "blocked").length,
+      1,
+      "the block itself stays in the audit ledger regardless of log",
+    );
   });
 
   it("extra match needles apply", async () => {
-    const c = newCalls();
-    const h = await plugin(
-      { client: makeClient(c) },
-      { ledger: false, matchMode: "name", match: ["my-proxy", "", 42] },
+    const h = makeCtx({
+      options: { ledger: false, matchMode: "name", match: ["my-proxy", "", 42] },
+    });
+    await plugin.setup(h.ctx);
+    await assert.rejects(
+      () => h.request(modelRequest("sess-m", "llama", "my-proxy", PROXY)),
+      /peak hours/,
     );
-    await assert.rejects(() => h["chat.params"](chatInput("sess-m", "llama", "my-proxy", PROXY)), /peak hours/);
   });
 
-  it("disabled plugin returns no hooks", async () => {
-    assert.deepEqual(await plugin({ client: makeClient(newCalls()) }, { disabled: true }), {});
+  it("disabled plugin registers nothing", async () => {
+    const h = makeCtx({ options: { disabled: true } });
+    assert.equal(await plugin.setup(h.ctx), undefined);
+    assert.deepEqual(h.calls.hooks, []);
   });
 
   it("works without options (all defaults)", async () => {
-    const c = newCalls();
-    await plugin({ client: makeClient(c) });
-    assert.ok(c.logs.some((l) => /match=endpoint/.test(l.message)));
+    const h = makeCtx({ options: { ledger: tmpLedger } });
+    await unlink(tmpLedger).catch(() => {});
+    await plugin.setup(h.ctx);
+    const events = await readEvents(tmpLedger);
+    assert.match(events[0].notice, /match=endpoint/);
+    assert.match(events[0].notice, /abortOnPeak=true/);
+    assert.match(events[0].notice, /OFF-PEAK|PEAK/);
+    await unlink(tmpLedger).catch(() => {});
   });
 
   it("rejects a broken schedule env", async () => {
     await withEnv({ DEEPSEEK_PEAK_SCHEDULE: "{oops" }, async () => {
-      await assert.rejects(() => plugin({ client: makeClient(newCalls()) }, { ledger: false }), /not valid JSON/);
+      await assert.rejects(() => plugin.setup(makeCtx({ options: { ledger: false } }).ctx), /not valid JSON/);
     });
   });
 
-  it("dispose is idempotent", async () => {
-    const h = await plugin({ client: makeClient(newCalls()) }, { ledger: false });
-    await h.dispose?.();
-    await h.dispose?.();
+  it("releases timers, the subscription and the rpc registration on cleanup", async () => {
+    const h = makeCtx({ options: { ledger: false } });
+    const cleanup = await plugin.setup(h.ctx);
+    assert.equal(typeof cleanup, "function");
+    await cleanup();
+    await cleanup(); // idempotent
+    assert.equal(h.calls.disposals, 2);
+    assert.deepEqual(h.calls.interrupts, []);
+  });
+
+  it("re-arms cleanly when no heads-up timer is configured", async () => {
+    const h = makeCtx({ options: { ledger: false, warnBeforeMin: 0 } });
+    await plugin.setup(h.ctx);
+    // Repeated requests re-arm the transition timer; with warnBeforeMin=0
+    // there is never a heads-up timer to clear.
+    for (const id of ["sess-a", "sess-b", "sess-c"]) {
+      await h.request(modelRequest(id, "claude-haiku", "neutralbeats-chat", PROXY));
+    }
+    const cleanup = await plugin.setup(makeCtx({ options: { ledger: false, warnBeforeMin: 0 } }).ctx);
+    await cleanup();
   });
 });
 
@@ -686,19 +812,11 @@ describe("opencode plugin (synthetic off-peak window)", () => {
   let notifyUrl;
 
   before(async () => {
-    const srv = createServer((req, res) => {
-      let body = "";
-      req.on("data", (c) => (body += c));
-      req.on("end", () => {
-        notified.push(body);
-        res.writeHead(200);
-        res.end("ok");
-      });
-    });
+    const srv = webhookServer((body) => notified.push(body));
     await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve));
     notifyUrl = `http://127.0.0.1:${srv.address().port}/hook`;
     globalThis.__offpeakSrv = srv;
-    plugin = (await import("../opencode-plugin.ts")).default;
+    plugin = (await import("../index.ts")).default;
   });
 
   after(async () => {
@@ -707,32 +825,48 @@ describe("opencode plugin (synthetic off-peak window)", () => {
 
   it("passes official traffic off-peak and announces the transition", async () => {
     await withEnv({ DEEPSEEK_PEAK_SCHEDULE: offPeakScheduleNow() }, async () => {
-      const c = newCalls();
+      const h = makeCtx({ options: { ledger: false, notifyUrl } });
       const base = scheduled.length;
-      const h = await plugin({ client: makeClient(c) }, { ledger: false, notifyUrl });
+      await plugin.setup(h.ctx);
       // Not peak → the request goes through untouched.
-      await h["chat.params"](chatInput("sess-off", "deepseek-chat", "deepseek", OFFICIAL));
-      assert.ok(c.logs.some((l) => /OFF-PEAK/.test(l.message)));
+      await h.request(modelRequest("sess-off", "deepseek-chat", "deepseek", OFFICIAL));
       // Warn timer points at the upcoming peak start.
       await scheduled[base + 1].fn();
-      await new Promise((r) => setImmediate(r));
-      assert.ok(c.toasts.some((t) => /peak starts in/.test(t.message)));
+      await flush();
+      assert.ok(h.calls.alerts.some((a) => /peak starts in/.test(a.data.message)));
       // Firing the transition timer still sees off-peak wall-clock time,
-      // so it takes the off-peak branch: toast + ledger + notify.
+      // so it takes the off-peak branch: alert + ledger + notify.
       await scheduled[base].fn();
+      await flush();
       await waitFor(() => notified.length > 0);
       const body = JSON.parse(notified.at(-1));
       assert.equal(body.event, "offpeak-start");
-      assert.ok(c.toasts.some((t) => /off-peak started/.test(t.message)));
-      // Same transition without notifyUrl: toast only, no HTTP.
-      const c2 = newCalls();
+      assert.ok(h.calls.alerts.some((a) => /off-peak started/.test(a.data.message)));
+      // Same transition without notifyUrl: alert only, no HTTP.
+      const h2 = makeCtx({ options: { ledger: false } });
       const base2 = scheduled.length;
-      const h2 = await plugin({ client: makeClient(c2) }, { ledger: false });
+      await plugin.setup(h2.ctx);
       const seen2 = notified.length;
       await scheduled[base2].fn();
-      await new Promise((r) => setImmediate(r));
-      assert.ok(c2.toasts.some((t) => /off-peak started/.test(t.message)));
+      await flush();
+      assert.ok(h2.calls.alerts.some((a) => /off-peak started/.test(a.data.message)));
       assert.equal(notified.length, seen2);
+    });
+  });
+
+  it("warns about an upcoming off-peak window", async () => {
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: offPeakScheduleNow() }, async () => {
+      const h = makeCtx({ options: { ledger: false } });
+      const base = scheduled.length;
+      await plugin.setup(h.ctx);
+      // Re-arm so the heads-up points at the peak window, not at "now".
+      await h.request(modelRequest("sess-off2", "deepseek-chat", "deepseek", OFFICIAL));
+      const warn = scheduled.slice(base).find((s, i) => i > 0);
+      assert.ok(warn);
+      await warn.fn();
+      await flush();
+      const kinds = h.calls.alerts.map((a) => a.data.kind);
+      assert.ok(kinds.includes("warn"));
     });
   });
 });
@@ -741,10 +875,10 @@ describe("opencode plugin (sync cache schedules)", () => {
   let plugin;
 
   const cacheFor = (n) => join(tmpdir(), `deepseek-peak-smoke-cache-${process.pid}-${n}.json`);
-  const caches = [cacheFor(1), cacheFor(2), cacheFor(3)];
+  const caches = [cacheFor(1), cacheFor(2), cacheFor(3), cacheFor(4)];
 
   before(async () => {
-    plugin = (await import("../opencode-plugin.ts")).default;
+    plugin = (await import("../index.ts")).default;
   });
 
   after(async () => {
@@ -769,15 +903,25 @@ describe("opencode plugin (sync cache schedules)", () => {
     };
   }
 
+  const noticeFor = async (options) => {
+    const h = makeCtx({ options: { ...options, ledger: tmpLedger } });
+    await unlink(tmpLedger).catch(() => {});
+    await plugin.setup(h.ctx);
+    const events = await readEvents(tmpLedger);
+    await unlink(tmpLedger).catch(() => {});
+    return events.map((e) => e.notice ?? "").join("\n");
+  };
+
   it("uses the sync cache when present", async () => {
     await writeCache(caches[0], peakCacheNow());
     await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[0] }, async () => {
-      const c = newCalls();
-      const h = await plugin({ client: makeClient(c) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /source=cache/.test(l.message)));
+      const notice = await noticeFor({});
+      assert.match(notice, /source=cache/);
       // Cached hours say peak now (regardless of the real schedule) → official blocks.
+      const h = makeCtx({ options: { ledger: false } });
+      await plugin.setup(h.ctx);
       await assert.rejects(
-        () => h["chat.params"](chatInput("sess-cache", "deepseek-chat", "deepseek", OFFICIAL)),
+        () => h.request(modelRequest("sess-cache", "deepseek-chat", "deepseek", OFFICIAL)),
         /peak hours/,
       );
     });
@@ -790,11 +934,7 @@ describe("opencode plugin (sync cache schedules)", () => {
       schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
     });
     await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[1] }, async () => {
-      const c = newCalls();
-      await plugin({ client: makeClient(c) }, { ledger: false });
-      const warn = c.logs.find((l) => /older than 30 days/.test(l.message));
-      assert.ok(warn);
-      assert.equal(warn.level, "warn");
+      assert.match(await noticeFor({}), /older than 30 days/);
     });
   });
 
@@ -804,19 +944,16 @@ describe("opencode plugin (sync cache schedules)", () => {
       schedule: [{ days: [0, 1, 2, 3, 4, 5, 6], start: "00:00", end: "01:00" }],
     });
     await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[2] }, async () => {
-      const c = newCalls();
-      await plugin({ client: makeClient(c) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /unknown/.test(l.message)));
+      assert.match(await noticeFor({}), /unknown/);
     });
   });
 
   it("warns on an invalid cache and falls back to built-in", async () => {
-    await writeCache(caches[2], "junk {{{");
-    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[2] }, async () => {
-      const c = newCalls();
-      await plugin({ client: makeClient(c) }, { ledger: false });
-      assert.ok(c.logs.some((l) => /source=builtin/.test(l.message)));
-      assert.ok(c.logs.some((l) => /cache ignored/.test(l.message)));
+    await writeCache(caches[3], "junk {{{");
+    await withEnv({ DEEPSEEK_PEAK_SCHEDULE: undefined, DEEPSEEK_PEAK_CACHE: caches[3] }, async () => {
+      const notice = await noticeFor({});
+      assert.match(notice, /source=builtin/);
+      assert.match(notice, /cache ignored/);
     });
   });
 });

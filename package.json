@@ -1,14 +1,19 @@
 {
   "name": "deepseek-peak",
-  "version": "0.4.0",
-  "description": "Track DeepSeek API peak/off-peak pricing hours. CLI for humans and scripts, plus an opencode plugin that blocks DeepSeek requests during peak hours and aborts running sessions.",
+  "version": "0.5.0",
+  "description": "Track DeepSeek API peak/off-peak pricing hours. CLI for humans and scripts, plus an opencode plugin that blocks DeepSeek requests during peak hours and interrupts running sessions.",
   "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./rpc": "./rpc.ts",
+    "./tui": "./tui.ts"
+  },
   "bin": {
     "deepseek-peak": "./cli.mjs"
   },
   "scripts": {
     "test": "node --test test/*.mjs",
-    "coverage": "node --test --experimental-test-coverage \"--test-coverage-include=lib/**\" \"--test-coverage-include=cli.mjs\" \"--test-coverage-include=opencode-plugin.ts\" --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 test/*.mjs",
+    "coverage": "node --test --experimental-test-coverage \"--test-coverage-include=lib/**\" \"--test-coverage-include=cli.mjs\" \"--test-coverage-include=index.ts\" \"--test-coverage-include=rpc.ts\" \"--test-coverage-include=tui.ts\" --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 test/*.mjs",
     "status": "node ./cli.mjs status",
     "typecheck": "tsc --noEmit"
   },
@@ -16,8 +21,9 @@
     "node": ">=22.18"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.0",
+    "@opencode/plugin": "^2.0.16",
     "@types/node": "^22.0.0",
+    "solid-js": "^1.9.15",
     "typescript": "^5.6.0"
   }
 }

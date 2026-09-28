@@ -10,8 +10,8 @@ Everything else is off-peak, billed at **half** the peak rates.
 Two parts, one schedule core (`lib/schedule.mjs`, zero dependencies):
 
 1. **CLI** (`cli.mjs`) — status, live countdown, and scripting helpers.
-2. **opencode plugin** (`opencode-plugin.ts`) — blocks DeepSeek requests
-   during peak hours and aborts already-running DeepSeek sessions the
+2. **opencode plugin** (`index.ts` + `tui.ts`) — blocks DeepSeek requests
+   during peak hours and interrupts already-running DeepSeek sessions the
    moment peak begins.
 
 ## CLI
@@ -147,31 +147,51 @@ The plugin can do the same on every schedule transition via the
 
 ## opencode plugin
 
-Clone the repo, then register the plugin globally — either copy
-`opencode-plugin.ts` plus the `lib/` directory into
-`~/.config/opencode/plugins/` (keeping their relative layout, so the
-`./lib/schedule.mjs` import keeps resolving; files directly under
-`plugins/` are auto-loaded), or reference it by path in
-`~/.config/opencode/opencode.jsonc`:
+Requires **opencode 2.x** (the plugin uses the V2 plugin API: `Plugin.define`,
+`setup(ctx)`, `ctx.session.hook`, `ctx.event.subscribe`, `ctx.rpc`).
+
+Point the global config at this directory. OpenCode resolves the package
+entry (`index.ts`) and, because the package also exposes a `./tui`
+entrypoint, loads the notification half into the CLI automatically — no
+second entry in `cli.json`:
 
 ```jsonc
-"plugin": [
-  ["file:///path/to/deepseek-peak/opencode-plugin.ts",
-   { "mode": "block", "abortOnPeak": true }]
-]
+// ~/.config/opencode/opencode.jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "file:///path/to/deepseek-peak",
+      "options": { "mode": "block", "abortOnPeak": true }
+    }
+  ]
+}
 ```
 
-Restart opencode after changing config or the plugin file (loaded once at startup).
+Then `opencode service restart`. Verify with:
+
+```sh
+opencode api get '/api/plugin' | grep deepseek-peak
+```
+
+The configured path must be a **directory** (or an npm package) — opencode
+rejects a path that points at a single file, so `".../opencode-plugin.ts"`
+will not load.
 
 What it does:
 
+- **`model.request` hook** — the single guard point. It runs immediately
+  before *every* model call a session issues: the agent loop plus title,
+  compaction and generate calls, so nothing bills at peak rates through a
+  side channel. If the request is guarded (see below) **and** it is peak:
+  - `mode: "block"` (default) — throws, the request never reaches the API.
+    The error names the model, the endpoint, and when off-peak starts.
+  - `mode: "warn"` — lets the request through and publishes a warning.
 - **Endpoint-first matching** — peak pricing applies ONLY to DeepSeek's
   official API, so the plugin checks where the request actually goes, not
-  just the model name. The endpoint resolves as: explicit
-  `provider.options.baseURL` (custom config override) first, else the
-  model's canonical `api.url` (models.dev default — this is how the
-  built-in `deepseek` provider is detected, since its options carry no
-  `baseURL`):
+  just the model name. The endpoint is the `baseURL` the server resolved for
+  that exact request, falling back to the provider catalog's
+  `settings.baseURL`:
   - `matchMode: "endpoint"` (default) — guard official-endpoint traffic.
     Known proxies always pass; an unknown endpoint falls back to name
     matching (conservative).
@@ -183,20 +203,24 @@ What it does:
     The error tells you when off-peak starts and how to relax the guard.
   - `mode: "warn"` — lets the request through, shows a warning toast.
 - **Peak-start timer** — armed for the exact next transition (re-armed on
-  every request, so laptop sleep can't leave a stale timer). When peak
-  begins it aborts busy sessions that used DeepSeek models (tracked via
-  `chat.params` + `session.status` events, double-checked with
-  `client.session.status()`), shows a TUI toast, and writes to the opencode
-   log. When off-peak begins it shows a "0.5x peak rates" toast.
-- **Pre-transition warning** — a heads-up toast `warnBeforeMin` minutes
+  every request, so laptop sleep cannot leave a stale timer). When peak
+  begins it interrupts sessions that used DeepSeek models. Candidates come
+  from the server event stream (`session.execution.*`), and whether a
+  session was really running is decided by the server's own
+  `session.interrupt` verdict, so nothing is polled.
+- **Toasts** — the server plugin publishes each decision over the `./rpc`
+  contract; the TUI half renders those as toasts. One source of truth, so a
+  terminal attached to a remote server still gets notified.
+- **Pre-transition warning** — a heads-up alert `warnBeforeMin` minutes
   before each transition (default 10), so you can wrap up in time.
-- **Ledger** — every block, warn-mode pass, abort, and transition is
-  appended to a JSONL ledger for `deepseek-peak report`.
+- **Ledger** — every block, warn-mode pass, interrupt, and transition is
+  appended to a JSONL ledger for `deepseek-peak report`. It doubles as the
+  plugin's diagnostic log, since V2 removed the plugin log API.
 - **Notifications** — optional JSON POST to `notifyUrl` on transitions.
 - Non-DeepSeek models are never blocked; with `abortAllOnPeak: true` their
-  busy sessions are aborted too (default `false`).
+  running sessions are interrupted too (default `false`).
 
-Options (second tuple element) and ENV overrides:
+Options (the `options` object) and ENV overrides:
 
 | Option | Default | ENV |
 |---|---|---|
@@ -212,6 +236,9 @@ Options (second tuple element) and ENV overrides:
 | `notifyUrl` | `""` | `DEEPSEEK_PEAK_NOTIFY_URL` |
 | `disabled` | `false` | `DEEPSEEK_PEAK_DISABLE=1` (kill-switch) |
 
+`toast` is honoured by the TUI half; `log` only controls the diagnostic
+notices, never the audit entries.
+
 ## Development
 
 ```sh
@@ -221,12 +248,14 @@ npm run coverage   # same suite with a 100% lines/branches/functions gate
 npm run typecheck  # tsc --noEmit
 ```
 
-`test/plugin.smoke.mjs` drives the real plugin with a mocked opencode
-client and a synthetic peak window around "now", so it passes at any hour:
-endpoint/name matching, block/pass behavior, warn mode, abort-selection at
-the peak transition, ledger writes, and notification POSTs.
-`test/commands-*.test.mjs` drive every CLI command in-process with
-synthetic schedules (deterministic at any hour).
+`test/plugin.smoke.mjs` drives the real plugin through its V2 surface
+(`setup(ctx)`, `ctx.session.hook`, `ctx.event.subscribe`, `ctx.rpc`) with a
+fake context and a synthetic peak window around "now", so it passes at any
+hour: endpoint/name matching, block/pass behavior across request kinds, warn
+mode, interrupt selection at the peak transition, ledger writes, alert
+publishing, and notification POSTs. `test/tui.smoke.mjs` covers the toast
+half, `test/present.test.mjs` the reconnect loop, and
+`test/commands-*.test.mjs` every CLI command in-process.
 
 ## Files
 
@@ -235,19 +264,28 @@ deepseek-peak/
   lib/schedule.mjs      schedule core (UTC, no deps) + sync-cache loading
   lib/sync.mjs          docs scraping with strict parsing + cache writing
   lib/match.mjs         endpoint-first DeepSeek matching (official API vs proxies)
+  lib/options.mjs       option + ENV resolution shared by both plugin halves
+  lib/alerts.mjs        alert payload contract (kinds, variants, validation)
+  lib/present.mjs       alert stream -> toasts, with reconnect and cleanup
   lib/ledger.mjs        JSONL ledger: append/read/summarize/savings estimate
   lib/notify.mjs        best-effort JSON POST alerts (ntfy/webhooks)
   lib/commands.mjs      all CLI logic (import-safe; cli.mjs is a 3-line entry)
   cli.mjs               CLI entry point (status/day/report/watch/wait/next/is-peak/sync)
-  opencode-plugin.ts    opencode plugin (type-only external import)
+  index.ts              server plugin: guard hook, transitions, interrupts, alerts
+  rpc.ts                RPC definition for the alert channel
+  tui.ts                TUI plugin: renders alerts as toasts
   test/schedule.test.mjs
   test/sync.test.mjs
   test/match.test.mjs
+  test/options.test.mjs
+  test/alerts.test.mjs
+  test/present.test.mjs
   test/ledger.test.mjs
   test/notify.test.mjs
   test/commands-parse.test.mjs   pure renders, arg parsing
   test/commands-run.test.mjs     every command end-to-end in-process
   test/plugin.smoke.mjs
+  test/tui.smoke.mjs
   test/helpers.mjs               synthetic schedules, env/console helpers
   package.json / tsconfig.json / README.md
 ```
